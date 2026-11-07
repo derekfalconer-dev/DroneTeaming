@@ -21,10 +21,34 @@ from dataclasses import asdict, dataclass
 
 
 SCHEMA_VERSION = "3.0"
-APPLICATION_BUILD = "moving-search-noisy-fusion-2026-11-06"
+APPLICATION_BUILD = "priority-response-stage-a-2026-11-06"
 SCENARIO_NAME = "Seeded noisy overlapping moving-search patrol"
 DEFAULT_SCENARIO_SEED = 20261106
 SCENARIO_OBJECT_COUNT = 24
+MIN_PRIORITY_OBJECT_COUNT = 1
+MAX_PRIORITY_OBJECT_COUNT = 5
+RANDOM_PRIORITY_OBJECT_COUNT = 0
+PLAYBOOK_REPORT_CONTINUE = "report_continue"
+PLAYBOOK_OBSERVE_ORBIT = "observe_orbit"
+PLAYBOOK_ORBIT_FOLLOW = "orbit_follow"
+ENABLED_PLAYBOOKS = {PLAYBOOK_REPORT_CONTINUE, PLAYBOOK_OBSERVE_ORBIT}
+SUPPORTED_PLAYBOOKS = ENABLED_PLAYBOOKS | {PLAYBOOK_ORBIT_FOLLOW}
+DEFAULT_PLAYBOOK = PLAYBOOK_REPORT_CONTINUE
+TASK_ELECTION_SECONDS = 1.5
+ORBIT_RADIUS_M = 85.0
+ORBIT_ANGULAR_RATE_DEG_PER_SECOND = 9.0
+MAX_RESPONSE_SPEED_MPS = 38.0
+MAX_RESPONSE_TURN_RATE_DEG_PER_SECOND = 55.0
+SCENARIO_BOUND_EAST_M = 620.0
+SCENARIO_BOUND_NORTH_M = 520.0
+PRIORITY_SIGNATURE_PREFIX = "mock-search-signature"
+RESPONSE_LIMITATION_NOTE = (
+    "Stage A supports deterministic ownership and stationary observe-and-orbit only. "
+    "Objective identity is the mocked per-object search signature from accepted observations; "
+    "local map IDs and hidden truth IDs are never used as cross-node task identity. "
+    "Connected-peer claim convergence is supported, but radio partition recovery, owner-failure "
+    "reassignment, moving-object tracking, and orbit-and-follow are future Stage B work."
+)
 STALE_AFTER_SECONDS = 6.0
 TRAIL_SAMPLE_INTERVAL_SECONDS = 0.5
 TRAIL_RETENTION_SECONDS = 30.0
@@ -119,12 +143,23 @@ class DroneStatus:
     altitude_m: float
     speed_mps: float
     heading_deg: float
+    camera_yaw_deg: float
     battery_percent: float
     timestamp: float
     paused: bool
     sharing_enabled: bool
+    selected_playbook: str
+    playbook_config_version: int
+    requested_priority_count: int
+    priority_object_count: int
     camera_footprint: list[dict[str, float]]
     flight_trail: list[dict[str, float]]
+    response_task: dict[str, object] | None
+    response_tasks: list[dict[str, object]]
+    response_queue_depth: int
+    orbit_radius_m: float
+    current_mode: str
+    assigned_objective: str | None
     diagnostics: dict[str, object]
 
 
@@ -146,6 +181,7 @@ class Observation:
     label: str
     classification_score: float
     covariance: list[list[float]]
+    priority_evidence: dict[str, object] | None = None
     measurement_type: str = "point"
     object_id: str = ""
 
@@ -455,27 +491,74 @@ def noisy_measurement_for_truth(
     )
 
 
-def generate_ground_truth_objects(seed: int) -> list[dict[str, float | str]]:
+def resolve_priority_object_count(seed: int, requested_priority_count: int = RANDOM_PRIORITY_OBJECT_COUNT) -> int:
+    if requested_priority_count == RANDOM_PRIORITY_OBJECT_COUNT:
+        return random.Random(f"{seed}:priority-count").randint(MIN_PRIORITY_OBJECT_COUNT, MAX_PRIORITY_OBJECT_COUNT)
+
+    return max(MIN_PRIORITY_OBJECT_COUNT, min(MAX_PRIORITY_OBJECT_COUNT, requested_priority_count))
+
+
+def priority_signature_for(seed: int, priority_index: int) -> str:
+    return f"{PRIORITY_SIGNATURE_PREFIX}-{hashlib.sha256(f'{seed}:{priority_index}'.encode('utf-8')).hexdigest()[:10]}"
+
+
+def task_id_for_priority_signature(scenario_seed: int, signature_id: str) -> str:
+    return hashlib.sha256(f"{scenario_seed}:{signature_id}".encode("utf-8")).hexdigest()[:18]
+
+
+def generate_ground_truth_objects(
+    seed: int,
+    requested_priority_count: int = RANDOM_PRIORITY_OBJECT_COUNT,
+) -> list[dict[str, float | str | bool]]:
     rng = random.Random(seed)
     routes = generate_patrol_routes(seed)
     shared_east_m = routes[1].waypoints_m[3][0]
     shared_north_m = (routes[1].waypoints_m[3][1] + routes[2].waypoints_m[3][1]) / 2.0
-    objects: list[dict[str, float | str]] = []
+    priority_count = resolve_priority_object_count(seed, requested_priority_count)
+    priority_index = 0
+    objects: list[dict[str, float | str | bool]] = []
 
-    def add_object(internal_id: str, label: str, east_m: float, north_m: float) -> None:
+    def add_object(
+        internal_id: str,
+        label: str,
+        east_m: float,
+        north_m: float,
+        *,
+        priority: bool = False,
+    ) -> None:
+        nonlocal priority_index
         latitude, longitude = local_m_to_lat_lon(east_m, north_m)
-        objects.append(
-            {
-                "id": internal_id,
-                "label": label,
-                "latitude": latitude,
-                "longitude": longitude,
-            },
-        )
+        item: dict[str, float | str | bool] = {
+            "id": internal_id,
+            "label": label,
+            "latitude": latitude,
+            "longitude": longitude,
+            "priority": priority,
+        }
 
-    add_object(f"truth-{seed}-shared-rb-00", "vehicle", shared_east_m + 45.0, shared_north_m)
-    add_object(f"truth-{seed}-shared-rb-01", "generator", shared_east_m + 82.0, shared_north_m + 8.0)
-    add_object(f"truth-{seed}-shared-rbg-02", "antenna", shared_east_m + 8.0, shared_north_m + 88.0)
+        if priority:
+            item["priority_signature"] = priority_signature_for(seed, priority_index)
+            item["priority_rank"] = priority_index + 1
+            priority_index += 1
+
+        objects.append(item)
+
+    priority_candidates = [
+        ("shared-rb-00", "vehicle", shared_east_m + 45.0, shared_north_m),
+        ("shared-rb-01", "generator", shared_east_m + 82.0, shared_north_m + 8.0),
+        ("shared-rbg-02", "antenna", shared_east_m + 8.0, shared_north_m + 88.0),
+        ("red-route-03", "equipment case", routes[1].waypoints_m[4][0] + 70.0, routes[1].waypoints_m[4][1] + 12.0),
+        ("blue-route-04", "storage crate", routes[2].waypoints_m[4][0] + 70.0, routes[2].waypoints_m[4][1] - 12.0),
+    ]
+
+    for candidate_index, (suffix, label, east_m, north_m) in enumerate(priority_candidates):
+        add_object(
+            f"truth-{seed}-priority-{suffix}",
+            label,
+            east_m,
+            north_m,
+            priority=candidate_index < priority_count,
+        )
 
     object_index = 3
     for drone_id in sorted(DRONE_PROFILES):
@@ -520,6 +603,26 @@ def normalize_angle_deg(angle: float) -> float:
     return (angle + 180.0) % 360.0 - 180.0
 
 
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def move_toward(current: float, target: float, maximum_delta: float) -> float:
+    if abs(target - current) <= maximum_delta:
+        return target
+
+    return current + (maximum_delta if target > current else -maximum_delta)
+
+
+def move_angle_toward(current_deg: float, target_deg: float, maximum_delta_deg: float) -> float:
+    delta = normalize_angle_deg(target_deg - current_deg)
+
+    if abs(delta) <= maximum_delta_deg:
+        return target_deg % 360.0
+
+    return (current_deg + (maximum_delta_deg if delta > 0 else -maximum_delta_deg)) % 360.0
+
+
 class DroneSimulator:
     """Own one drone's telemetry, observation store, object map, and peer transport."""
 
@@ -529,6 +632,8 @@ class DroneSimulator:
         name: str,
         peers: list[str],
         scenario_seed: int = DEFAULT_SCENARIO_SEED,
+        requested_priority_count: int = RANDOM_PRIORITY_OBJECT_COUNT,
+        selected_playbook: str = DEFAULT_PLAYBOOK,
     ) -> None:
         profile = DRONE_PROFILES[drone_id]
         self.drone_id = drone_id
@@ -539,8 +644,12 @@ class DroneSimulator:
         self.base_heading_deg = float(profile["heading_deg"])
         self.peers = peers
         self.scenario_seed = scenario_seed
+        self.requested_priority_count = requested_priority_count
+        self.priority_object_count = resolve_priority_object_count(scenario_seed, requested_priority_count)
+        self.selected_playbook = selected_playbook if selected_playbook in ENABLED_PLAYBOOKS else DEFAULT_PLAYBOOK
+        self.playbook_config_version = 0
         self.routes = generate_patrol_routes(scenario_seed)
-        self.truth_objects = generate_ground_truth_objects(scenario_seed)
+        self.truth_objects = generate_ground_truth_objects(scenario_seed, requested_priority_count)
 
         self.lock = threading.RLock()
         self.last_wall_time = time.monotonic()
@@ -553,6 +662,20 @@ class DroneSimulator:
         self.objects: dict[str, dict[str, object]] = {}
         self.track_to_object: dict[str, str] = {}
         self.unresolved_observations: dict[str, dict[str, object]] = {}
+        self.response_tasks: dict[str, dict[str, object]] = {}
+        self.response_task_queue: list[str] = []
+        self.active_response_task_id: str | None = None
+        self.claims: dict[str, dict[int, dict[str, object]]] = {}
+        self.outbound_claims: list[dict[str, object]] = []
+        self.cancelled_priority_signatures: set[str] = set()
+        self.response_east_m: float | None = None
+        self.response_north_m: float | None = None
+        self.response_heading_deg: float | None = None
+        self.response_camera_yaw_deg: float | None = None
+        self.return_east_m: float | None = None
+        self.return_north_m: float | None = None
+        self.return_heading_deg: float | None = None
+        self.orbit_phase_deg = 0.0
         self.last_local_observation: Observation | None = None
         self.local_observations_generated = 0
         self.peer_observations_sent = 0
@@ -575,12 +698,27 @@ class DroneSimulator:
 
     def _advance_locked(self) -> None:
         now = time.monotonic()
+        elapsed = now - self.last_wall_time
         if not self.paused:
-            self.simulation_time += now - self.last_wall_time
+            self.simulation_time += elapsed
+            self._resolve_response_tasks_locked()
+            self._update_response_guidance_locked(elapsed)
+            self._update_return_to_patrol_locked(elapsed)
             self._update_flight_trail_locked()
         self.last_wall_time = now
 
     def _pose_at_locked(self) -> tuple[float, float, float]:
+        if self._has_local_response_control_locked():
+            assert self.response_east_m is not None
+            assert self.response_north_m is not None
+            assert self.response_heading_deg is not None
+            latitude, longitude = local_m_to_lat_lon(self.response_east_m, self.response_north_m)
+            return latitude, longitude, self.response_heading_deg
+
+        if self.return_east_m is not None and self.return_north_m is not None and self.return_heading_deg is not None:
+            latitude, longitude = local_m_to_lat_lon(self.return_east_m, self.return_north_m)
+            return latitude, longitude, self.return_heading_deg
+
         return patrol_pose_on_route(self.routes[self.drone_id], self.simulation_time)
 
     def _pose_at_time_locked(self, simulation_time: float) -> tuple[float, float, float]:
@@ -588,7 +726,7 @@ class DroneSimulator:
 
     def _update_flight_trail_locked(self) -> None:
         while self.next_trail_sample_time <= self.simulation_time:
-            latitude, longitude, _heading = self._pose_at_time_locked(self.next_trail_sample_time)
+            latitude, longitude, _heading = self._pose_at_locked()
             self.flight_trail.append(
                 {
                     "latitude": latitude,
@@ -605,11 +743,19 @@ class DroneSimulator:
             if float(point["timestamp"]) > cutoff
         ][-int((TRAIL_RETENTION_SECONDS / TRAIL_SAMPLE_INTERVAL_SECONDS) + 2):]
 
+    def _camera_yaw_locked(self) -> float:
+        if self._has_local_response_control_locked() and self.response_camera_yaw_deg is not None:
+            return self.response_camera_yaw_deg
+
+        _latitude, _longitude, heading = self._pose_at_locked()
+        return heading
+
     def _camera_footprint_locked(self) -> list[dict[str, float]]:
-        latitude, longitude, heading = self._pose_at_locked()
+        latitude, longitude, _heading = self._pose_at_locked()
+        camera_yaw = self._camera_yaw_locked()
         points = [{"latitude": latitude, "longitude": longitude}]
 
-        for angle in (heading - CAMERA_HALF_ANGLE_DEG, heading + CAMERA_HALF_ANGLE_DEG):
+        for angle in (camera_yaw - CAMERA_HALF_ANGLE_DEG, camera_yaw + CAMERA_HALF_ANGLE_DEG):
             angle_rad = math.radians(angle)
             east_m = math.sin(angle_rad) * CAMERA_RANGE_M
             north_m = math.cos(angle_rad) * CAMERA_RANGE_M
@@ -619,7 +765,8 @@ class DroneSimulator:
         return points
 
     def _is_in_camera_footprint_locked(self, latitude: float, longitude: float) -> bool:
-        drone_latitude, drone_longitude, heading = self._pose_at_locked()
+        drone_latitude, drone_longitude, _heading = self._pose_at_locked()
+        heading = self._camera_yaw_locked()
         east_m, north_m = lat_lon_to_local_m(drone_latitude, drone_longitude, latitude, longitude)
         distance_m = math.hypot(east_m, north_m)
 
@@ -650,12 +797,23 @@ class DroneSimulator:
                 altitude_m=altitude,
                 speed_mps=speed,
                 heading_deg=heading,
+                camera_yaw_deg=self._camera_yaw_locked(),
                 battery_percent=battery,
                 timestamp=self.simulation_time,
                 paused=self.paused,
                 sharing_enabled=self.sharing_enabled,
+                selected_playbook=self.selected_playbook,
+                playbook_config_version=self.playbook_config_version,
+                requested_priority_count=self.requested_priority_count,
+                priority_object_count=self.priority_object_count,
                 camera_footprint=self._camera_footprint_locked(),
                 flight_trail=list(self.flight_trail),
+                response_task=self._visible_response_task_locked(),
+                response_tasks=self._visible_response_tasks_locked(),
+                response_queue_depth=len(self.response_task_queue),
+                orbit_radius_m=ORBIT_RADIUS_M,
+                current_mode=self._current_mode_locked(),
+                assigned_objective=self._assigned_objective_locked(),
                 diagnostics=self._diagnostics_locked(),
             )
 
@@ -667,8 +825,18 @@ class DroneSimulator:
                 "app_build": APPLICATION_BUILD,
                 "scenario_name": SCENARIO_NAME,
                 "scenario_seed": self.scenario_seed,
+                "selected_playbook": self.selected_playbook,
+                "playbook_config_version": self.playbook_config_version,
+                "requested_priority_count": self.requested_priority_count,
+                "priority_object_count": self.priority_object_count,
                 "simulation_time": self.simulation_time,
                 "object_count": len(self.truth_objects),
+                "priority_discovered_count": self._priority_discovered_count_locked(),
+                "response_task": self._visible_response_task_locked(),
+                "response_tasks": self._visible_response_tasks_locked(),
+                "response_queue_depth": len(self.response_task_queue),
+                "orbit_radius_m": ORBIT_RADIUS_M,
+                "response_limitation_note": RESPONSE_LIMITATION_NOTE,
                 "objects": list(self.truth_objects),
             }
 
@@ -697,6 +865,14 @@ class DroneSimulator:
                 "simulation_time": self.simulation_time,
                 "sharing_enabled": self.sharing_enabled,
                 "paused": self.paused,
+                "selected_playbook": self.selected_playbook,
+                "playbook_config_version": self.playbook_config_version,
+                "requested_priority_count": self.requested_priority_count,
+                "priority_object_count": self.priority_object_count,
+                "response_task": self._visible_response_task_locked(),
+                "response_tasks": self._visible_response_tasks_locked(),
+                "response_queue_depth": len(self.response_task_queue),
+                "orbit_radius_m": ORBIT_RADIUS_M,
                 "objects": sorted(
                     objects,
                     key=lambda item: str(item["object_id"]),
@@ -715,8 +891,15 @@ class DroneSimulator:
                 "drone_id": self.drone_id,
                 "paused": self.paused,
                 "sharing_enabled": self.sharing_enabled,
+                "selected_playbook": self.selected_playbook,
+                "playbook_config_version": self.playbook_config_version,
+                "requested_priority_count": self.requested_priority_count,
+                "priority_object_count": self.priority_object_count,
                 "observation_count": len(self.observations),
                 "object_count": len(self.objects),
+                "response_task": self._visible_response_task_locked(),
+                "response_tasks": self._visible_response_tasks_locked(),
+                "response_queue_depth": len(self.response_task_queue),
                 "unresolved_observation_count": len(self.unresolved_observations),
                 "diagnostics": self._diagnostics_locked(),
             }
@@ -731,13 +914,47 @@ class DroneSimulator:
         with self.lock:
             self.sharing_enabled = sharing_enabled
 
-    def reset(self, scenario_seed: int | None = None) -> None:
+    def set_playbook(self, selected_playbook: str, config_version: int | None = None) -> bool:
+        if selected_playbook not in ENABLED_PLAYBOOKS:
+            return False
+
+        with self.lock:
+            self._advance_locked()
+            next_version = max(self.playbook_config_version + 1, int(config_version or 0))
+
+            if selected_playbook == self.selected_playbook and next_version <= self.playbook_config_version:
+                return True
+
+            previous_playbook = self.selected_playbook
+            self.selected_playbook = selected_playbook
+            self.playbook_config_version = next_version
+
+            if previous_playbook == PLAYBOOK_REPORT_CONTINUE and selected_playbook == PLAYBOOK_OBSERVE_ORBIT:
+                self._make_discovered_priorities_available_locked()
+            elif previous_playbook == PLAYBOOK_OBSERVE_ORBIT and selected_playbook == PLAYBOOK_REPORT_CONTINUE:
+                self._release_active_response_tasks_locked()
+
+            return True
+
+    def reset(
+        self,
+        scenario_seed: int | None = None,
+        requested_priority_count: int | None = None,
+        selected_playbook: str | None = None,
+    ) -> None:
         with self.lock:
             if scenario_seed is not None:
                 self.scenario_seed = scenario_seed
 
+            if requested_priority_count is not None:
+                self.requested_priority_count = requested_priority_count
+
+            if selected_playbook is not None:
+                self.selected_playbook = selected_playbook if selected_playbook in ENABLED_PLAYBOOKS else DEFAULT_PLAYBOOK
+
+            self.priority_object_count = resolve_priority_object_count(self.scenario_seed, self.requested_priority_count)
             self.routes = generate_patrol_routes(self.scenario_seed)
-            self.truth_objects = generate_ground_truth_objects(self.scenario_seed)
+            self.truth_objects = generate_ground_truth_objects(self.scenario_seed, self.requested_priority_count)
             self.last_wall_time = time.monotonic()
             self.simulation_time = 0.0
             self.flight_trail.clear()
@@ -748,6 +965,20 @@ class DroneSimulator:
             self.objects.clear()
             self.track_to_object.clear()
             self.unresolved_observations.clear()
+            self.response_tasks.clear()
+            self.response_task_queue.clear()
+            self.active_response_task_id = None
+            self.claims.clear()
+            self.outbound_claims.clear()
+            self.cancelled_priority_signatures.clear()
+            self.response_east_m = None
+            self.response_north_m = None
+            self.response_heading_deg = None
+            self.response_camera_yaw_deg = None
+            self.return_east_m = None
+            self.return_north_m = None
+            self.return_heading_deg = None
+            self.orbit_phase_deg = 0.0
             self.last_local_observation = None
             self.local_observations_generated = 0
             self.peer_observations_sent = 0
@@ -799,6 +1030,17 @@ class DroneSimulator:
                 measured_latitude, measured_longitude = local_m_to_lat_lon(east_m, north_m)
                 score = 0.88
                 sensor_model = SENSOR_MODELS[self.drone_id]
+                priority_signature = truth_object.get("priority_signature")
+                priority_evidence = None
+
+                if bool(truth_object.get("priority", False)) and priority_signature:
+                    priority_evidence = {
+                        "signature_id": str(priority_signature),
+                        "signature_type": "mocked_search_signature_match",
+                        "match_score": 0.97,
+                        "model": "stage-a-mock-signature-v1",
+                    }
+
                 observation = Observation(
                     id=observation_id,
                     scenario_run_id=f"{self.scenario_seed}",
@@ -816,6 +1058,7 @@ class DroneSimulator:
                     label=str(truth_object["label"]),
                     classification_score=score,
                     covariance=covariance,
+                    priority_evidence=priority_evidence,
                     object_id=f"{sensor_model.sensor_id}:{source_track_id}",
                 )
 
@@ -919,6 +1162,7 @@ class DroneSimulator:
                 [float(covariance[0][0]), float(covariance[0][1])],  # type: ignore[index]
                 [float(covariance[1][0]), float(covariance[1][1])],  # type: ignore[index]
             ],
+            priority_evidence=payload.get("priority_evidence") if isinstance(payload.get("priority_evidence"), dict) else None,
             measurement_type=str(payload.get("measurement_type", "point")),
             object_id=str(payload.get("object_id", "")),
         )
@@ -940,7 +1184,140 @@ class DroneSimulator:
             "most_recent_received_observation_id": self.most_recent_received_observation_id,
             "most_recent_received_source": self.most_recent_received_source,
             "most_recent_sent_observation_id": self.most_recent_sent_observation_id,
+            "selected_playbook": self.selected_playbook,
+            "playbook_config_version": self.playbook_config_version,
+            "priority_object_count": self.priority_object_count,
+            "priority_discovered_count": self._priority_discovered_count_locked(),
+            "response_task": self._visible_response_task_locked(),
+            "response_tasks": self._visible_response_tasks_locked(),
+            "response_queue_depth": len(self.response_task_queue),
+            "orbit_radius_m": ORBIT_RADIUS_M,
+            "current_mode": self._current_mode_locked(),
+            "assigned_objective": self._assigned_objective_locked(),
+            "response_limitation_note": RESPONSE_LIMITATION_NOTE,
         }
+
+    def _make_discovered_priorities_available_locked(self) -> None:
+        for object_map in self.objects.values():
+            if bool(object_map.get("priority", False)) and object_map.get("priority_signature"):
+                self._ensure_response_task_for_priority_object_locked(object_map)
+
+        for task_id, task in sorted(self.response_tasks.items()):
+            if str(task.get("signature_id")) in self.cancelled_priority_signatures:
+                continue
+
+            if task.get("status") != "reported":
+                continue
+
+            task["playbook_config_version"] = self.playbook_config_version
+            task["updated_at"] = self.simulation_time
+            task["owner_task_state"] = None
+
+            if self.active_response_task_id is None:
+                task["status"] = "electing"
+                task["election_deadline"] = self.simulation_time + TASK_ELECTION_SECONDS
+                self.active_response_task_id = task_id
+                claim = self._task_claim_payload_locked(task)
+                self.claims.setdefault(task_id, {})[self.drone_id] = claim
+                self.outbound_claims.append(claim)
+            else:
+                task["status"] = "queued"
+                if task_id not in self.response_task_queue:
+                    self.response_task_queue.append(task_id)
+
+    def _task_display_label(self, label: object) -> str:
+        return f"PRIORITY {str(label or 'Objective').replace('_', ' ').title()}"
+
+    def _ensure_response_task_for_priority_object_locked(self, object_map: dict[str, object]) -> None:
+        signature_id = str(object_map["priority_signature"])
+
+        if signature_id in self.cancelled_priority_signatures:
+            return
+
+        task_id = task_id_for_priority_signature(self.scenario_seed, signature_id)
+
+        if task_id in self.response_tasks:
+            return
+
+        east_m = float(object_map["east_m"])
+        north_m = float(object_map["north_m"])
+        infeasible = abs(east_m) + ORBIT_RADIUS_M > SCENARIO_BOUND_EAST_M or abs(north_m) + ORBIT_RADIUS_M > SCENARIO_BOUND_NORTH_M
+        local_available = self.active_response_task_id is None
+        status = "queued" if not local_available else "electing"
+        task = {
+            "task_id": task_id,
+            "scenario_run_id": str(self.scenario_seed),
+            "signature_id": signature_id,
+            "object_label": str(object_map.get("label", "objective")),
+            "display_label": self._task_display_label(object_map.get("label", "objective")),
+            "status": "infeasible" if infeasible else status,
+            "selected_playbook": self.selected_playbook,
+            "playbook_config_version": self.playbook_config_version,
+            "created_at": self.simulation_time,
+            "updated_at": self.simulation_time,
+            "last_observation_at": float(object_map["last_seen"]),
+            "election_deadline": self.simulation_time + TASK_ELECTION_SECONDS,
+            "estimated_east_m": east_m,
+            "estimated_north_m": north_m,
+            "estimated_latitude": float(object_map["latitude"]),
+            "estimated_longitude": float(object_map["longitude"]),
+            "assigned_drone_id": None,
+            "assigned_drone_name": None,
+            "orbit_radius_m": ORBIT_RADIUS_M,
+            "revision": 0,
+            "event": "Previously discovered priority evidence became eligible under observe-and-orbit.",
+            "limitation": RESPONSE_LIMITATION_NOTE,
+        }
+        self.response_tasks[task_id] = task
+
+        if infeasible:
+            task["event"] = "Requested orbit is infeasible within scenario bounds."
+            return
+
+        if local_available:
+            self.active_response_task_id = task_id
+            claim = self._task_claim_payload_locked(task)
+            self.claims.setdefault(task_id, {})[self.drone_id] = claim
+            self.outbound_claims.append(claim)
+        else:
+            self.response_task_queue.append(task_id)
+
+    def _start_return_to_patrol_locked(self) -> None:
+        latitude, longitude, heading = self._pose_at_locked()
+        east_m, north_m = lat_lon_to_local_m(
+            MAP_REFERENCE_LATITUDE,
+            MAP_REFERENCE_LONGITUDE,
+            latitude,
+            longitude,
+        )
+        self.return_east_m = east_m
+        self.return_north_m = north_m
+        self.return_heading_deg = heading
+
+    def _release_active_response_tasks_locked(self) -> None:
+        for task_id, task in self.response_tasks.items():
+            if str(task.get("signature_id")) in self.cancelled_priority_signatures:
+                continue
+
+            if task.get("assigned_drone_id") == self.drone_id and task.get("status") in {"transitioning", "orbiting"}:
+                self._start_return_to_patrol_locked()
+                self.outbound_claims.append(self._task_claim_payload_locked(task, "released"))
+
+            if task.get("status") in {"transitioning", "orbiting", "assigned_remote", "electing", "queued"}:
+                task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
+                task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
+                task["assigned_drone_id"] = None
+                task["assigned_drone_name"] = None
+                task["status"] = "reported"
+                task["owner_task_state"] = "released"
+                task["updated_at"] = self.simulation_time
+                task["playbook_config_version"] = self.playbook_config_version
+
+            if task_id in self.response_task_queue:
+                self.response_task_queue.remove(task_id)
+
+        self.active_response_task_id = None
+        self._clear_response_guidance_locked()
 
     def _observation_id(self, source_track_id: str, observation_time_bucket: int) -> str:
         raw_id = f"{self.drone_id}:{SENSOR_MODELS[self.drone_id].sensor_id}:{source_track_id}:{observation_time_bucket}"
@@ -1059,6 +1436,7 @@ class DroneSimulator:
             "north_m": observation.north_m,
             "classification_score": observation.classification_score,
             "covariance": observation.covariance,
+            "priority_evidence": observation.priority_evidence,
         }
 
     def _refresh_fused_object_locked(self, object_map: dict[str, object]) -> None:
@@ -1172,6 +1550,9 @@ class DroneSimulator:
                 "active_contribution_count": 0,
                 "contributions": {},
                 "measurements": [],
+                "priority": False,
+                "priority_evidence": None,
+                "priority_signature": None,
             }
 
         object_map = self.objects[associated_object_id]
@@ -1194,8 +1575,612 @@ class DroneSimulator:
         )
         object_map["observation_count"] = int(object_map["observation_count"]) + 1
         object_map["observation_ids"] = [*list(object_map["observation_ids"]), observation.id]
+
+        if observation.priority_evidence:
+            object_map["priority"] = True
+            object_map["priority_evidence"] = observation.priority_evidence
+            object_map["priority_signature"] = str(observation.priority_evidence["signature_id"])
+
         self._refresh_fused_object_locked(object_map)
+
+        if observation.priority_evidence:
+            self._ensure_response_task_locked(observation, object_map)
+
         return True
+
+    def _priority_discovered_count_locked(self) -> int:
+        return len(
+            {
+                str(item.get("priority_signature"))
+                for item in self.objects.values()
+                if bool(item.get("priority", False)) and item.get("priority_signature")
+            },
+        )
+
+    def _visible_response_task_locked(self) -> dict[str, object] | None:
+        if self.active_response_task_id is not None:
+            task = self.response_tasks.get(self.active_response_task_id)
+            return dict(task) if task is not None else None
+
+        visible_tasks = self._visible_response_tasks_locked()
+        return visible_tasks[0] if visible_tasks else None
+
+    def _visible_response_tasks_locked(self) -> list[dict[str, object]]:
+        return [
+            dict(task)
+            for task in sorted(
+                self.response_tasks.values(),
+                key=lambda item: (str(item["signature_id"]), str(item["task_id"])),
+            )
+        ]
+
+    def _current_mode_locked(self) -> str:
+        task = self.response_tasks.get(self.active_response_task_id or "")
+
+        if task is None:
+            return "patrol"
+
+        if task.get("status") in {"transitioning", "orbiting"}:
+            return str(task["status"])
+
+        return "patrol"
+
+    def _assigned_objective_locked(self) -> str | None:
+        task = self.response_tasks.get(self.active_response_task_id or "")
+
+        if task is None or task.get("status") not in {"transitioning", "orbiting"}:
+            return None
+
+        return str(task["signature_id"])
+
+    def _has_local_response_control_locked(self) -> bool:
+        task = self.response_tasks.get(self.active_response_task_id or "")
+
+        return bool(
+            task
+            and task.get("assigned_drone_id") == self.drone_id
+            and task.get("status") in {"transitioning", "orbiting"}
+            and self.selected_playbook == PLAYBOOK_OBSERVE_ORBIT
+            and int(task.get("playbook_config_version", self.playbook_config_version)) == self.playbook_config_version
+        )
+
+    def _clear_response_guidance_locked(self) -> None:
+        self.response_east_m = None
+        self.response_north_m = None
+        self.response_heading_deg = None
+        self.response_camera_yaw_deg = None
+
+    def _initialize_local_response_control_locked(self, task: dict[str, object]) -> None:
+        task_id = str(task["task_id"])
+
+        if (
+            self.active_response_task_id == task_id
+            and self.response_east_m is not None
+            and self.response_north_m is not None
+            and self.response_heading_deg is not None
+            and self.response_camera_yaw_deg is not None
+        ):
+            return
+
+        latitude, longitude, heading = self._pose_at_locked()
+        response_east_m, response_north_m = lat_lon_to_local_m(
+            MAP_REFERENCE_LATITUDE,
+            MAP_REFERENCE_LONGITUDE,
+            latitude,
+            longitude,
+        )
+        self.active_response_task_id = task_id
+        self.response_east_m = response_east_m
+        self.response_north_m = response_north_m
+        self.response_heading_deg = heading
+        self.response_camera_yaw_deg = heading
+
+        estimate_east_m = float(task["estimated_east_m"])
+        estimate_north_m = float(task["estimated_north_m"])
+        delta_east_m = response_east_m - estimate_east_m
+        delta_north_m = response_north_m - estimate_north_m
+
+        if math.hypot(delta_east_m, delta_north_m) > 0.0:
+            self.orbit_phase_deg = math.degrees(math.atan2(delta_north_m, delta_east_m)) % 360.0
+
+    def _task_state_update_key(
+        self,
+        status: str,
+        owner_drone_id: object,
+        owner_drone_name: object,
+    ) -> tuple[int, int, str]:
+        precedence = {
+            "cancelled": 5,
+            "released": 3,
+            "orbiting": 4,
+            "transitioning": 3,
+            "reported": 2,
+            "assigned_remote": 1,
+        }.get(status, 0)
+
+        try:
+            owner_id = int(owner_drone_id) if owner_drone_id is not None else 1_000_000_000
+        except (TypeError, ValueError):
+            owner_id = 1_000_000_000
+
+        return (-precedence, owner_id, str(owner_drone_name or ""))
+
+    def _claim_cost_to_estimate_locked(self, east_m: float, north_m: float) -> float:
+        latitude, longitude, _heading = self._pose_at_locked()
+        drone_east_m, drone_north_m = lat_lon_to_local_m(
+            MAP_REFERENCE_LATITUDE,
+            MAP_REFERENCE_LONGITUDE,
+            latitude,
+            longitude,
+        )
+        return math.hypot(east_m - drone_east_m, north_m - drone_north_m)
+
+    def _task_claim_payload_locked(self, task: dict[str, object], status: str = "claiming") -> dict[str, object]:
+        east_m = float(task["estimated_east_m"])
+        north_m = float(task["estimated_north_m"])
+        revision = int(task.get("revision", 0)) + (0 if status == "claiming" else 1)
+
+        if status != "claiming":
+            task["revision"] = revision
+
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "app_build": APPLICATION_BUILD,
+            "scenario_run_id": str(self.scenario_seed),
+            "task_id": str(task["task_id"]),
+            "signature_id": str(task["signature_id"]),
+            "object_label": str(task.get("object_label", "objective")),
+            "display_label": str(task.get("display_label", self._task_display_label(task.get("object_label", "objective")))),
+            "claimant_drone_id": self.drone_id,
+            "claimant_drone_name": self.name,
+            "owner_drone_id": task.get("assigned_drone_id"),
+            "owner_drone_name": task.get("assigned_drone_name"),
+            "status": status,
+            "task_state": status,
+            "revision": revision,
+            "playbook": self.selected_playbook,
+            "playbook_config_version": self.playbook_config_version,
+            "cost": self._claim_cost_to_estimate_locked(east_m, north_m),
+            "created_at": float(task["created_at"]),
+            "updated_at": self.simulation_time,
+            "estimated_east_m": east_m,
+            "estimated_north_m": north_m,
+            "estimated_latitude": float(task["estimated_latitude"]),
+            "estimated_longitude": float(task["estimated_longitude"]),
+            "orbit_radius_m": ORBIT_RADIUS_M,
+            "election_deadline": float(task["election_deadline"]),
+        }
+
+    def _ensure_response_task_locked(self, observation: Observation, object_map: dict[str, object]) -> None:
+        assert observation.priority_evidence is not None
+        signature_id = str(observation.priority_evidence["signature_id"])
+        task_id = task_id_for_priority_signature(self.scenario_seed, signature_id)
+
+        if signature_id in self.cancelled_priority_signatures:
+            return
+
+        if task_id in self.response_tasks:
+            task = self.response_tasks[task_id]
+            task["object_label"] = str(object_map.get("label", task.get("object_label", observation.label)))
+            task["display_label"] = self._task_display_label(task["object_label"])
+            task["last_observation_at"] = max(float(task.get("last_observation_at", 0.0)), observation.timestamp)
+            task["updated_at"] = self.simulation_time
+            return
+
+        east_m = float(object_map["east_m"])
+        north_m = float(object_map["north_m"])
+        infeasible = abs(east_m) + ORBIT_RADIUS_M > SCENARIO_BOUND_EAST_M or abs(north_m) + ORBIT_RADIUS_M > SCENARIO_BOUND_NORTH_M
+        local_available = self.active_response_task_id is None
+        status = "queued" if not local_available else "electing"
+        task = {
+            "task_id": task_id,
+            "scenario_run_id": str(self.scenario_seed),
+            "signature_id": signature_id,
+            "object_label": observation.label,
+            "display_label": self._task_display_label(observation.label),
+            "status": "infeasible" if infeasible else status,
+            "selected_playbook": self.selected_playbook,
+            "playbook_config_version": self.playbook_config_version,
+            "created_at": self.simulation_time,
+            "updated_at": self.simulation_time,
+            "last_observation_at": observation.timestamp,
+            "election_deadline": self.simulation_time + TASK_ELECTION_SECONDS,
+            "estimated_east_m": east_m,
+            "estimated_north_m": north_m,
+            "estimated_latitude": float(object_map["latitude"]),
+            "estimated_longitude": float(object_map["longitude"]),
+            "assigned_drone_id": None,
+            "assigned_drone_name": None,
+            "orbit_radius_m": ORBIT_RADIUS_M,
+            "revision": 0,
+            "event": "Priority evidence accepted; deterministic claim election started.",
+            "limitation": RESPONSE_LIMITATION_NOTE,
+        }
+        self.response_tasks[task_id] = task
+
+        if infeasible:
+            task["event"] = "Requested orbit is infeasible within scenario bounds."
+            return
+
+        if local_available:
+            self.active_response_task_id = task_id
+            claim = self._task_claim_payload_locked(task)
+            self.claims.setdefault(task_id, {})[self.drone_id] = claim
+            self.outbound_claims.append(claim)
+        else:
+            self.response_task_queue.append(task_id)
+
+    def _record_claim_locked(self, payload: dict[str, object]) -> bool:
+        if str(payload.get("scenario_run_id")) != str(self.scenario_seed):
+            return False
+
+        task_id = str(payload["task_id"])
+        claimant_drone_id = int(payload["claimant_drone_id"])
+        east_m = float(payload["estimated_east_m"])
+        north_m = float(payload["estimated_north_m"])
+        latitude, longitude = local_m_to_lat_lon(east_m, north_m)
+        payload_status = str(payload.get("task_state", payload.get("status", "claiming")))
+        signature_id = str(payload.get("signature_id", task_id))
+        revision = int(payload.get("revision", 0))
+
+        if task_id not in self.response_tasks:
+            status = "queued" if self.active_response_task_id is not None else "electing"
+            self.response_tasks[task_id] = {
+                "task_id": task_id,
+                "scenario_run_id": str(self.scenario_seed),
+                "signature_id": signature_id,
+                "object_label": str(payload.get("object_label", "objective")),
+                "display_label": str(payload.get("display_label", self._task_display_label(payload.get("object_label", "objective")))),
+                "status": status,
+                "selected_playbook": self.selected_playbook,
+                "playbook_config_version": self.playbook_config_version,
+                "created_at": self.simulation_time,
+                "updated_at": self.simulation_time,
+                "last_observation_at": float(payload.get("updated_at", self.simulation_time)),
+                "election_deadline": max(self.simulation_time + TASK_ELECTION_SECONDS, float(payload.get("election_deadline", self.simulation_time))),
+                "estimated_east_m": east_m,
+                "estimated_north_m": north_m,
+                "estimated_latitude": latitude,
+                "estimated_longitude": longitude,
+                "assigned_drone_id": None,
+                "assigned_drone_name": None,
+                "orbit_radius_m": ORBIT_RADIUS_M,
+                "revision": 0,
+                "event": "Peer claim received; local deterministic election joined.",
+                "limitation": RESPONSE_LIMITATION_NOTE,
+            }
+
+            if self.active_response_task_id is None:
+                self.active_response_task_id = task_id
+                local_claim = self._task_claim_payload_locked(self.response_tasks[task_id])
+                self.claims.setdefault(task_id, {})[self.drone_id] = local_claim
+                self.outbound_claims.append(local_claim)
+            else:
+                self.response_task_queue.append(task_id)
+
+        task = self.response_tasks[task_id]
+
+        if payload_status in {"transitioning", "orbiting", "reported", "cancelled", "released"}:
+            current_revision = int(task.get("revision", 0))
+
+            if revision < current_revision:
+                return False
+
+            incoming_key = self._task_state_update_key(
+                payload_status,
+                payload.get("owner_drone_id"),
+                payload.get("owner_drone_name"),
+            )
+            current_key = self._task_state_update_key(
+                str(task.get("owner_task_state", task.get("status", "queued"))),
+                task.get("assigned_drone_id"),
+                task.get("assigned_drone_name"),
+            )
+
+            if revision == current_revision and incoming_key > current_key:
+                return False
+
+            owner_drone_id = payload.get("owner_drone_id")
+            owner_drone_name = payload.get("owner_drone_name")
+            task["revision"] = revision
+            task["assigned_drone_id"] = owner_drone_id
+            task["assigned_drone_name"] = owner_drone_name
+            task["object_label"] = str(payload.get("object_label", task.get("object_label", "objective")))
+            task["display_label"] = str(payload.get("display_label", task.get("display_label", self._task_display_label(task.get("object_label", "objective")))))
+            task["updated_at"] = self.simulation_time
+            task["owner_task_state"] = payload_status
+            task["playbook_config_version"] = int(payload.get("playbook_config_version", task.get("playbook_config_version", 0)))
+            task["event"] = f"Peer task state received: {payload_status}."
+
+            if payload_status == "cancelled":
+                task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
+                task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
+                task["assigned_drone_id"] = None
+                task["assigned_drone_name"] = None
+                task["status"] = "cancelled"
+                self.cancelled_priority_signatures.add(signature_id)
+
+                if task_id in self.response_task_queue:
+                    self.response_task_queue.remove(task_id)
+
+                if self.active_response_task_id == task_id:
+                    self.active_response_task_id = None
+                    self._clear_response_guidance_locked()
+            elif payload_status in {"released", "reported"}:
+                task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
+                task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
+                task["assigned_drone_id"] = None
+                task["assigned_drone_name"] = None
+                task["status"] = "reported"
+
+                if self.active_response_task_id == task_id:
+                    self.active_response_task_id = None
+                    self._clear_response_guidance_locked()
+                    self._promote_next_queued_task_locked()
+            elif int(owner_drone_id) == self.drone_id:
+                self._demote_other_active_assignments_for_owner_locked(self.drone_id, task_id)
+                self._initialize_local_response_control_locked(task)
+                task["status"] = payload_status
+            else:
+                self._demote_other_active_assignments_for_owner_locked(int(owner_drone_id), task_id)
+                task["status"] = "assigned_remote"
+
+                if self.active_response_task_id == task_id:
+                    self.active_response_task_id = None
+                    self._clear_response_guidance_locked()
+                    self._promote_next_queued_task_locked()
+
+            return True
+
+        self.claims.setdefault(task_id, {})[claimant_drone_id] = dict(payload)
+        return True
+
+    def _demote_other_active_assignments_for_owner_locked(self, owner_drone_id: int, active_task_id: str) -> None:
+        for task_id, task in self.response_tasks.items():
+            if task_id == active_task_id:
+                continue
+
+            if task.get("assigned_drone_id") != owner_drone_id:
+                continue
+
+            if task.get("status") not in {"transitioning", "orbiting", "assigned_remote"}:
+                continue
+
+            task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
+            task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
+            task["assigned_drone_id"] = None
+            task["assigned_drone_name"] = None
+            task["status"] = "reported"
+            task["owner_task_state"] = "released"
+            task["revision"] = int(task.get("revision", 0)) + 1
+            task["updated_at"] = self.simulation_time
+            task["event"] = "Released locally to preserve one active assignment per drone."
+
+            if self.active_response_task_id == task_id:
+                self.active_response_task_id = None
+                self._clear_response_guidance_locked()
+
+            if task_id in self.response_task_queue:
+                self.response_task_queue.remove(task_id)
+
+    def receive_claim(self, payload: dict[str, object]) -> bool:
+        try:
+            with self.lock:
+                self._advance_locked()
+                return self._record_claim_locked(payload)
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def pop_outbound_claims(self) -> list[dict[str, object]]:
+        with self.lock:
+            claims = list(self.outbound_claims)
+            self.outbound_claims.clear()
+            return claims
+
+    def broadcast_claim(self, claim: dict[str, object]) -> None:
+        payload = json.dumps(claim).encode("utf-8")
+
+        for peer in self.peers:
+            request = urllib.request.Request(
+                f"{peer}/claims",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+
+            try:
+                with urllib.request.urlopen(request, timeout=0.4):
+                    pass
+            except (OSError, urllib.error.URLError):
+                continue
+
+    def _resolve_response_tasks_locked(self) -> None:
+        task = self.response_tasks.get(self.active_response_task_id or "")
+
+        if not task or task["status"] != "electing" or self.simulation_time < float(task["election_deadline"]):
+            return
+
+        claims = list(self.claims.get(str(task["task_id"]), {}).values())
+
+        if not claims:
+            claim = self._task_claim_payload_locked(task)
+            self.claims.setdefault(str(task["task_id"]), {})[self.drone_id] = claim
+            self.outbound_claims.append(claim)
+            claims = [claim]
+
+        winning_claim = sorted(
+            claims,
+            key=lambda claim: (
+                float(claim["cost"]),
+                int(claim["claimant_drone_id"]),
+                str(claim["claimant_drone_name"]),
+                str(task["task_id"]),
+            ),
+        )[0]
+        assigned_drone_id = int(winning_claim["claimant_drone_id"])
+        self._demote_other_active_assignments_for_owner_locked(assigned_drone_id, str(task["task_id"]))
+        task["assigned_drone_id"] = assigned_drone_id
+        task["assigned_drone_name"] = str(winning_claim["claimant_drone_name"])
+        task["updated_at"] = self.simulation_time
+
+        if self.selected_playbook == PLAYBOOK_REPORT_CONTINUE:
+            task["status"] = "reported"
+            task["playbook_config_version"] = self.playbook_config_version
+            task["event"] = "Priority objective reported; all drones continue patrol."
+            self.outbound_claims.append(self._task_claim_payload_locked(task, "reported"))
+            self.active_response_task_id = None
+            self._promote_next_queued_task_locked()
+        elif assigned_drone_id == self.drone_id:
+            self._initialize_local_response_control_locked(task)
+            task["status"] = "transitioning"
+            task["playbook_config_version"] = self.playbook_config_version
+            task["owner_task_state"] = "transitioning"
+            task["event"] = "This drone won deterministic election and is transitioning to orbit."
+            self.outbound_claims.append(self._task_claim_payload_locked(task, "transitioning"))
+        else:
+            task["status"] = "assigned_remote"
+            task["playbook_config_version"] = self.playbook_config_version
+            task["owner_task_state"] = "transitioning"
+            task["event"] = "Another drone won deterministic election; this drone continues patrol."
+            self.active_response_task_id = None
+            self._promote_next_queued_task_locked()
+
+    def _promote_next_queued_task_locked(self) -> None:
+        if self.active_response_task_id is not None:
+            return
+
+        queued_task_ids = [
+            task_id
+            for task_id in self.response_task_queue
+            if self.response_tasks.get(task_id, {}).get("status") == "queued"
+            and str(self.response_tasks.get(task_id, {}).get("signature_id")) not in self.cancelled_priority_signatures
+        ]
+
+        if not queued_task_ids:
+            return
+
+        next_task_id = sorted(queued_task_ids)[0]
+        self.response_task_queue.remove(next_task_id)
+        task = self.response_tasks[next_task_id]
+        task["status"] = "electing"
+        task["election_deadline"] = self.simulation_time + TASK_ELECTION_SECONDS
+        task["updated_at"] = self.simulation_time
+        self.active_response_task_id = next_task_id
+        claim = self._task_claim_payload_locked(task)
+        self.claims.setdefault(next_task_id, {})[self.drone_id] = claim
+        self.outbound_claims.append(claim)
+
+    def _update_response_guidance_locked(self, elapsed_seconds: float) -> None:
+        if not self._has_local_response_control_locked() or elapsed_seconds <= 0.0:
+            return
+
+        task = self.response_tasks[self.active_response_task_id or ""]
+        estimate_east_m = float(task["estimated_east_m"])
+        estimate_north_m = float(task["estimated_north_m"])
+        assert self.response_east_m is not None
+        assert self.response_north_m is not None
+        assert self.response_heading_deg is not None
+
+        self.orbit_phase_deg = (self.orbit_phase_deg + (ORBIT_ANGULAR_RATE_DEG_PER_SECOND * elapsed_seconds)) % 360.0
+        phase_rad = math.radians(self.orbit_phase_deg)
+        target_east_m = estimate_east_m + (math.cos(phase_rad) * ORBIT_RADIUS_M)
+        target_north_m = estimate_north_m + (math.sin(phase_rad) * ORBIT_RADIUS_M)
+        max_distance = MAX_RESPONSE_SPEED_MPS * elapsed_seconds
+        delta_east = target_east_m - self.response_east_m
+        delta_north = target_north_m - self.response_north_m
+        distance = math.hypot(delta_east, delta_north)
+
+        if distance <= max_distance or distance == 0.0:
+            self.response_east_m = target_east_m
+            self.response_north_m = target_north_m
+        else:
+            scale = max_distance / distance
+            self.response_east_m += delta_east * scale
+            self.response_north_m += delta_north * scale
+
+        desired_heading = math.degrees(math.atan2(delta_east, delta_north)) % 360.0
+        self.response_heading_deg = move_angle_toward(
+            self.response_heading_deg,
+            desired_heading,
+            MAX_RESPONSE_TURN_RATE_DEG_PER_SECOND * elapsed_seconds,
+        )
+        camera_bearing = math.degrees(
+            math.atan2(estimate_east_m - self.response_east_m, estimate_north_m - self.response_north_m),
+        ) % 360.0
+        self.response_camera_yaw_deg = camera_bearing
+
+        if distance < 6.0 and task["status"] == "transitioning":
+            task["status"] = "orbiting"
+            task["event"] = "Assigned drone entered standoff orbit around estimated position."
+            self.outbound_claims.append(self._task_claim_payload_locked(task, "orbiting"))
+
+        task["updated_at"] = self.simulation_time
+        task["camera_yaw_deg"] = self.response_camera_yaw_deg
+
+    def _update_return_to_patrol_locked(self, elapsed_seconds: float) -> None:
+        if (
+            elapsed_seconds <= 0.0
+            or self.return_east_m is None
+            or self.return_north_m is None
+            or self.return_heading_deg is None
+            or self._has_local_response_control_locked()
+        ):
+            return
+
+        patrol_latitude, patrol_longitude, patrol_heading = patrol_pose_on_route(self.routes[self.drone_id], self.simulation_time)
+        patrol_east_m, patrol_north_m = lat_lon_to_local_m(
+            MAP_REFERENCE_LATITUDE,
+            MAP_REFERENCE_LONGITUDE,
+            patrol_latitude,
+            patrol_longitude,
+        )
+        delta_east = patrol_east_m - self.return_east_m
+        delta_north = patrol_north_m - self.return_north_m
+        distance = math.hypot(delta_east, delta_north)
+        max_distance = MAX_RESPONSE_SPEED_MPS * elapsed_seconds
+
+        if distance <= max_distance or distance < 1.0:
+            self.return_east_m = None
+            self.return_north_m = None
+            self.return_heading_deg = None
+            return
+
+        scale = max_distance / distance
+        self.return_east_m += delta_east * scale
+        self.return_north_m += delta_north * scale
+        target_heading = math.degrees(math.atan2(delta_east, delta_north)) % 360.0
+        self.return_heading_deg = move_angle_toward(
+            self.return_heading_deg,
+            target_heading if distance > 2.0 else patrol_heading,
+            MAX_RESPONSE_TURN_RATE_DEG_PER_SECOND * elapsed_seconds,
+        )
+
+    def cancel_response(self, task_id: str | None = None) -> None:
+        with self.lock:
+            self._advance_locked()
+            target_task_id = task_id or self.active_response_task_id
+            task = self.response_tasks.get(target_task_id or "")
+
+            if task is not None:
+                signature_id = str(task["signature_id"])
+                self.cancelled_priority_signatures.add(signature_id)
+                task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
+                task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
+                task["assigned_drone_id"] = None
+                task["assigned_drone_name"] = None
+                task["status"] = "cancelled"
+                task["owner_task_state"] = "cancelled"
+                task["event"] = "Response cancelled; assigned drone returns to patrol."
+                task["updated_at"] = self.simulation_time
+
+                if str(task["task_id"]) in self.response_task_queue:
+                    self.response_task_queue.remove(str(task["task_id"]))
+
+                self.outbound_claims.append(self._task_claim_payload_locked(task, "cancelled"))
+
+            if self.active_response_task_id == target_task_id:
+                self.active_response_task_id = None
+                self._clear_response_guidance_locked()
 
 
 class DroneRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -1239,19 +2224,48 @@ class DroneRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"accepted": accepted})
             return
 
+        if self.path == "/claims":
+            accepted = self.simulator.receive_claim(payload)
+            self._send_json({"accepted": accepted})
+            return
+
         if self.path == "/control":
+            requested_priority_count = (
+                int(payload["priority_count"])
+                if "priority_count" in payload
+                else None
+            )
+            selected_playbook = (
+                str(payload["playbook"])
+                if "playbook" in payload
+                else None
+            )
+
             if "scenario_seed" in payload:
-                self.simulator.reset(int(payload["scenario_seed"]))
+                self.simulator.reset(int(payload["scenario_seed"]), requested_priority_count, selected_playbook)
             elif bool(payload.get("new_random_scenario", False)):
-                self.simulator.reset(time.time_ns() % 1_000_000_000)
+                self.simulator.reset(time.time_ns() % 1_000_000_000, requested_priority_count, selected_playbook)
             elif bool(payload.get("reset", False)) or bool(payload.get("restart_scenario", False)):
-                self.simulator.reset()
+                self.simulator.reset(None, requested_priority_count, selected_playbook)
 
             if "paused" in payload:
                 self.simulator.set_paused(bool(payload["paused"]))
 
             if "sharing_enabled" in payload:
                 self.simulator.set_sharing_enabled(bool(payload["sharing_enabled"]))
+
+            if "playbook" in payload:
+                self.simulator.set_playbook(
+                    str(payload["playbook"]),
+                    int(payload.get("playbook_config_version", 0)),
+                )
+
+            if bool(payload.get("cancel_response", False)):
+                self.simulator.cancel_response(
+                    str(payload["cancel_response_task_id"])
+                    if "cancel_response_task_id" in payload
+                    else None,
+                )
 
             redelivered = False
             if "redeliver_observation_id" in payload:
@@ -1303,12 +2317,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--peers", nargs="*", default=[])
     parser.add_argument("--seed", type=int, default=DEFAULT_SCENARIO_SEED)
+    parser.add_argument("--priority-count", type=int, default=RANDOM_PRIORITY_OBJECT_COUNT)
+    parser.add_argument("--playbook", choices=sorted(SUPPORTED_PLAYBOOKS), default=DEFAULT_PLAYBOOK)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    DroneRequestHandler.simulator = DroneSimulator(args.drone_id, args.name, args.peers, args.seed)
+    DroneRequestHandler.simulator = DroneSimulator(
+        args.drone_id,
+        args.name,
+        args.peers,
+        args.seed,
+        args.priority_count,
+        args.playbook,
+    )
 
     stop_event = threading.Event()
 
@@ -1328,6 +2351,9 @@ def main() -> int:
 
                 for observation in observations:
                     DroneRequestHandler.simulator.broadcast_observation(observation)
+
+                for claim in DroneRequestHandler.simulator.pop_outbound_claims():
+                    DroneRequestHandler.simulator.broadcast_claim(claim)
 
         observation_thread = threading.Thread(target=observe_and_share, name="drone-observer", daemon=True)
         observation_thread.start()
