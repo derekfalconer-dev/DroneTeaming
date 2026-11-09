@@ -34,6 +34,22 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
                 checked: true,
                 value: "0",
                 className: "",
+                get selectedOptions() {{
+                  const labels = {{
+                    "seeded_stationary_patrol": "Seeded stationary patrol",
+                    "moving_person_handoff": "Jogging person handoff",
+                    "report_continue": "Report and continue",
+                    "observe_orbit": "Observe and orbit",
+                    "orbit_follow": "Orbit and follow — Stage B",
+                    "0": "Random (1–5)",
+                    "1": "Red",
+                    "2": "Blue",
+                    "3": "Green",
+                    "4": "4",
+                    "5": "5",
+                  }};
+                  return [{{ value: this.value, textContent: labels[this.value] || this.value || "" }}];
+                }},
                 width: 520,
                 height: 360,
                 getBoundingClientRect() {{ return {{ width: 520, height: id.startsWith("belief-map") ? 420 : 360 }}; }},
@@ -97,6 +113,7 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
               setTimeout(callback) {{ callback(); }},
               window: {{ devicePixelRatio: 1, localStorage: {{ getItem() {{ return null; }}, setItem() {{}} }}, requestAnimationFrame(callback) {{ callback(); }} }},
               navigator: {{ clipboard: {{ writeText() {{}} }} }},
+              elements,
               process,
             }};
 
@@ -105,12 +122,12 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
             vm.runInContext({json.dumps(fixture_script)}, context);
 
             process.stdout.write(JSON.stringify({{
-              assignmentDetails: elements.get("assignment-details").innerHTML,
-              taskState: elements.get("task-state") ? elements.get("task-state").textContent : "",
-              beliefDetails1: elements.get("belief-details-1") ? elements.get("belief-details-1").innerHTML : "",
-              networkDetails: elements.get("network-details") ? elements.get("network-details").innerHTML : "",
-              networkSummary: elements.get("network-summary") ? elements.get("network-summary").textContent : "",
-              sharedInspector: elements.get("shared-inspector") ? elements.get("shared-inspector").innerHTML : "",
+              assignmentDetails: document.getElementById("assignment-details").innerHTML,
+              taskState: document.getElementById("task-state").textContent,
+              beliefDetails1: document.getElementById("belief-details-1").innerHTML,
+              networkDetails: document.getElementById("network-details").innerHTML,
+              networkSummary: document.getElementById("network-summary").textContent,
+              sharedInspector: document.getElementById("shared-inspector").innerHTML,
             }}));
             """
         )
@@ -137,6 +154,53 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
         self.assertIn('id="network-details"', launch_simulation.DASHBOARD_HTML)
         self.assertIn('id="tab-network"', launch_simulation.DASHBOARD_HTML)
         self.assertNotIn("<details open>\n      <summary>Peer HTTP diagnostics</summary>", launch_simulation.DASHBOARD_HTML)
+
+    def test_handoff_evidence_preserves_successful_handoff_after_track_loss(self) -> None:
+        fixture = """
+        state.scenarioId = "moving_person_handoff";
+        state.scenarioRunId = "dashboard-handoff-loss";
+        state.initialObserverId = 1;
+        state.nextObserverId = 2;
+        state.statuses.set(1, { id: 1 });
+        state.statuses.set(2, { id: 2 });
+        state.statuses.set(3, { id: 3 });
+        const trackedObject = {
+          local_object_id: "moving-a",
+          object_id: "moving-a",
+          label: "person",
+          priority: false,
+          tracking_model: "constant_velocity",
+          track_status: "tracked",
+          source_names: ["Red", "Blue"],
+          historical_sources: [1, 2],
+          historical_source_names: ["Red", "Blue"],
+          own_sensor: true,
+          teammate_sourced: true,
+          measurements: [
+            { observation_id: "red-a", scenario_run_id: "dashboard-handoff-loss", source_drone_id: 1, source_drone_name: "Red", sensor_id: "eo-red", source_track_id: "red-track" },
+            { observation_id: "blue-a", scenario_run_id: "dashboard-handoff-loss", source_drone_id: 2, source_drone_name: "Blue", sensor_id: "eo-blue", source_track_id: "blue-track" },
+          ],
+        };
+        const remoteObject = { ...trackedObject, own_sensor: false, teammate_sourced: true };
+        state.beliefs.set(1, { objects: [trackedObject] });
+        state.beliefs.set(2, { objects: [trackedObject] });
+        state.beliefs.set(3, { objects: [remoteObject] });
+        let html = handoffEvidenceSummaryHtml();
+        state.beliefs.set(1, { objects: [{ ...trackedObject, track_status: "lost", source_names: [] }] });
+        state.beliefs.set(2, { objects: [{ ...trackedObject, track_status: "lost", source_names: [] }] });
+        state.beliefs.set(3, { objects: [{ ...remoteObject, track_status: "lost", source_names: [] }] });
+        html += handoffEvidenceSummaryHtml();
+        process.stdout.write(JSON.stringify({ evidenceHtml: html }));
+        process.exit(0);
+        """
+        output = self.run_dashboard_script(fixture)
+
+        self.assertIn("Acquired by initial observer", output["evidenceHtml"])
+        self.assertIn("Reports accepted from next observer", output["evidenceHtml"])
+        self.assertIn("Mapped-object ID preserved", output["evidenceHtml"])
+        self.assertIn("Third node remote track", output["evidenceHtml"])
+        self.assertIn("Lost after timeout", output["evidenceHtml"])
+        self.assertGreaterEqual(output["evidenceHtml"].count("Verified"), 5)
 
     def test_selected_object_uses_historical_and_recent_sources_from_latest_polled_record(self) -> None:
         fixture = """

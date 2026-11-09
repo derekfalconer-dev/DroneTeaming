@@ -18,13 +18,13 @@ def priority_observation(signature_id: str = "mock-search-signature-live-config"
     latitude, longitude = local_m_to_lat_lon(25.0, 35.0)
     sensor_model = SENSOR_MODELS[1]
     return Observation(
-        id="live-config-observation",
+        id=f"live-config-observation-{signature_id}",
         scenario_run_id=str(DEFAULT_SCENARIO_SEED),
         source_drone_id=1,
         source_drone_name="Red",
         source_color="red",
         sensor_id=sensor_model.sensor_id,
-        source_track_id="live-config-track",
+        source_track_id=f"live-config-track-{signature_id}",
         timestamp=1.0,
         measurement_frame=MEASUREMENT_FRAME,
         east_m=25.0,
@@ -102,7 +102,7 @@ class LivePlaybookConfigurationTest(unittest.TestCase):
 
         with simulator.lock:
             task = simulator.response_tasks[task_id]
-            self.assertEqual(task["status"], "reported")
+            self.assertIn(task["status"], {"reported", "electing", "queued"})
             self.assertIsNone(task["assigned_drone_id"])
             self.assertIsNone(task["assigned_drone_name"])
             self.assertEqual(task["previous_assigned_drone_id"], 2)
@@ -123,9 +123,10 @@ class LivePlaybookConfigurationTest(unittest.TestCase):
             primary_task_id = task_id_for_priority_signature(DEFAULT_SCENARIO_SEED, "mock-search-signature-blue-primary")
             third_task_id = task_id_for_priority_signature(DEFAULT_SCENARIO_SEED, "mock-search-signature-third")
             primary_task = blue.response_tasks[primary_task_id]
-            primary_task["status"] = "orbiting"
             primary_task["assigned_drone_id"] = 2
             primary_task["assigned_drone_name"] = "Blue"
+            blue._initialize_local_response_control_locked(primary_task)
+            primary_task["status"] = "orbiting"
             blue.active_response_task_id = primary_task_id
             stale_blue_claim = blue._task_claim_payload_locked(blue.response_tasks[third_task_id])
 

@@ -18,8 +18,33 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass
+
+from moving_tracking import (
+    DEFAULT_SCENARIO_ID,
+    MOVING_HANDOFF_SCENARIO_ID,
+    MOVING_HANDOFF_SCENARIO_NAME,
+    MOVING_TRACK_BUFFER_LIMIT,
+    MOVING_TRACK_BUFFER_SECONDS,
+    MOVING_TRACK_LOST_SECONDS,
+    MOVING_TRACK_REPORT_TYPE,
+    MOVING_TRACK_TRACKED_SECONDS,
+    MOVING_TRACK_TRAIL_SECONDS,
+    TRACK_REPORT_SCHEMA_VERSION,
+    horizontal_uncertainty_m,
+    initialize_track,
+    innovation_for_position,
+    moving_handoff_background_points,
+    moving_handoff_pose_for,
+    moving_lifecycle,
+    moving_person_position,
+    moving_person_trajectory,
+    new_run_id,
+    predict_state,
+    update_with_position,
+)
 
 
 SCHEMA_VERSION = "3.0"
@@ -36,6 +61,9 @@ PLAYBOOK_ORBIT_FOLLOW = "orbit_follow"
 ENABLED_PLAYBOOKS = {PLAYBOOK_REPORT_CONTINUE, PLAYBOOK_OBSERVE_ORBIT}
 SUPPORTED_PLAYBOOKS = ENABLED_PLAYBOOKS | {PLAYBOOK_ORBIT_FOLLOW}
 DEFAULT_PLAYBOOK = PLAYBOOK_REPORT_CONTINUE
+AVAILABLE_SCENARIOS = {DEFAULT_SCENARIO_ID, MOVING_HANDOFF_SCENARIO_ID}
+DEFAULT_INITIAL_OBSERVER_ID = 1
+DEFAULT_NEXT_OBSERVER_ID = 2
 TASK_ELECTION_SECONDS = 1.5
 ORBIT_RADIUS_M = 85.0
 ORBIT_ANGULAR_RATE_DEG_PER_SECOND = 9.0
@@ -188,6 +216,16 @@ class Observation:
     priority_evidence: dict[str, object] | None = None
     measurement_type: str = "point"
     object_id: str = ""
+    report_schema_version: str = "legacy-observation-v1"
+    source_node_session_id: str = ""
+    report_id: str = ""
+    state_epoch: float | None = None
+    velocity_east_mps: float | None = None
+    velocity_north_mps: float | None = None
+    state_covariance: list[list[float]] | None = None
+    sensor_track_status: str = "active"
+    simulated: bool = True
+    supporting_observation_ids: list[str] | None = None
 
 
 def meters_per_deg_lon(latitude: float) -> float:
@@ -510,10 +548,46 @@ def task_id_for_priority_signature(scenario_seed: int, signature_id: str) -> str
     return hashlib.sha256(f"{scenario_seed}:{signature_id}".encode("utf-8")).hexdigest()[:18]
 
 
+def generate_moving_handoff_objects() -> list[dict[str, float | str | bool]]:
+    objects: list[dict[str, float | str | bool]] = []
+
+    for object_id, label, east_m, north_m in moving_handoff_background_points():
+        latitude, longitude = local_m_to_lat_lon(east_m, north_m)
+        objects.append(
+            {
+                "id": object_id,
+                "label": label,
+                "latitude": latitude,
+                "longitude": longitude,
+                "priority": False,
+                "moving": False,
+            },
+        )
+
+    east_m, north_m = moving_person_position(0.0)
+    latitude, longitude = local_m_to_lat_lon(east_m, north_m)
+    objects.append(
+        {
+            "id": "private-moving-person",
+            "label": "person",
+            "latitude": latitude,
+            "longitude": longitude,
+            "priority": False,
+            "moving": True,
+            "trajectory": moving_person_trajectory(),
+        },
+    )
+    return objects
+
+
 def generate_ground_truth_objects(
     seed: int,
     requested_priority_count: int = RANDOM_PRIORITY_OBJECT_COUNT,
+    scenario_id: str = DEFAULT_SCENARIO_ID,
 ) -> list[dict[str, float | str | bool]]:
+    if scenario_id == MOVING_HANDOFF_SCENARIO_ID:
+        return generate_moving_handoff_objects()
+
     rng = random.Random(seed)
     routes = generate_patrol_routes(seed)
     shared_east_m = routes[1].waypoints_m[3][0]
@@ -640,6 +714,10 @@ class DroneSimulator:
         selected_playbook: str = DEFAULT_PLAYBOOK,
         api_host: str = "127.0.0.1",
         api_port: int = 0,
+        scenario_id: str = DEFAULT_SCENARIO_ID,
+        initial_observer_id: int = DEFAULT_INITIAL_OBSERVER_ID,
+        next_observer_id: int = DEFAULT_NEXT_OBSERVER_ID,
+        scenario_run_id: str | None = None,
     ) -> None:
         profile = DRONE_PROFILES[drone_id]
         self.drone_id = drone_id
@@ -651,15 +729,30 @@ class DroneSimulator:
         self.peers = peers
         self.scenario_seed = scenario_seed
         self.requested_priority_count = requested_priority_count
-        self.priority_object_count = resolve_priority_object_count(scenario_seed, requested_priority_count)
         self.selected_playbook = selected_playbook if selected_playbook in ENABLED_PLAYBOOKS else DEFAULT_PLAYBOOK
         self.api_host = api_host
         self.api_port = api_port
         self.hostname = socket.gethostname()
         self.process_id = os.getpid()
         self.playbook_config_version = 0
+        self.scenario_id = scenario_id if scenario_id in AVAILABLE_SCENARIOS else DEFAULT_SCENARIO_ID
+        self.priority_object_count = (
+            0
+            if self.scenario_id == MOVING_HANDOFF_SCENARIO_ID
+            else resolve_priority_object_count(scenario_seed, requested_priority_count)
+        )
+        self.initial_observer_id = initial_observer_id if initial_observer_id in DRONE_PROFILES else DEFAULT_INITIAL_OBSERVER_ID
+        self.next_observer_id = next_observer_id if next_observer_id in DRONE_PROFILES else DEFAULT_NEXT_OBSERVER_ID
+        if self.next_observer_id == self.initial_observer_id:
+            self.next_observer_id = next(
+                candidate_id
+                for candidate_id in sorted(DRONE_PROFILES)
+                if candidate_id != self.initial_observer_id
+            )
+        self.scenario_run_id = scenario_run_id or str(scenario_seed)
+        self.node_session_id = f"{self.drone_id}-{uuid.uuid4().hex[:12]}"
         self.routes = generate_patrol_routes(scenario_seed)
-        self.truth_objects = generate_ground_truth_objects(scenario_seed, requested_priority_count)
+        self.truth_objects = generate_ground_truth_objects(scenario_seed, requested_priority_count, self.scenario_id)
 
         self.lock = threading.RLock()
         self.last_wall_time = time.monotonic()
@@ -672,6 +765,11 @@ class DroneSimulator:
         self.objects: dict[str, dict[str, object]] = {}
         self.track_to_object: dict[str, str] = {}
         self.unresolved_observations: dict[str, dict[str, object]] = {}
+        self.moving_report_buffer: list[Observation] = []
+        self.moving_report_ids: set[str] = set()
+        self.moving_committed_report_ids: set[str] = set()
+        self.moving_rejected_report_count = 0
+        self.moving_processing_epoch = -math.inf
         self.response_tasks: dict[str, dict[str, object]] = {}
         self.response_task_queue: list[str] = []
         self.active_response_task_id: str | None = None
@@ -727,12 +825,17 @@ class DroneSimulator:
     def _advance_locked(self, update_flight_trail: bool = True) -> None:
         now = time.monotonic()
         elapsed = now - self.last_wall_time
+
+        if not math.isfinite(elapsed) or elapsed < 0.0:
+            elapsed = 0.0
+
         if not self.paused:
             self.simulation_time += elapsed
             self._reconcile_eligible_work_locked()
             self._resolve_response_tasks_locked()
             self._update_response_guidance_locked(elapsed)
             self._update_return_to_patrol_locked(elapsed)
+            self._process_moving_report_buffer_locked()
 
             if update_flight_trail:
                 self._update_flight_trail_locked()
@@ -750,10 +853,35 @@ class DroneSimulator:
             latitude, longitude = local_m_to_lat_lon(self.return_east_m, self.return_north_m)
             return latitude, longitude, self.return_heading_deg
 
+        if self.scenario_id == MOVING_HANDOFF_SCENARIO_ID:
+            pose = moving_handoff_pose_for(self.drone_id, self.initial_observer_id, self.next_observer_id)
+            latitude, longitude = local_m_to_lat_lon(pose.east_m, pose.north_m)
+            return latitude, longitude, pose.heading_deg
+
         return patrol_pose_on_route(self.routes[self.drone_id], self.simulation_time)
 
     def _pose_at_time_locked(self, simulation_time: float) -> tuple[float, float, float]:
+        if self.scenario_id == MOVING_HANDOFF_SCENARIO_ID:
+            pose = moving_handoff_pose_for(self.drone_id, self.initial_observer_id, self.next_observer_id)
+            latitude, longitude = local_m_to_lat_lon(pose.east_m, pose.north_m)
+            return latitude, longitude, pose.heading_deg
+
         return patrol_pose_on_route(self.routes[self.drone_id], simulation_time)
+
+    def _refresh_moving_truth_objects_locked(self) -> None:
+        if self.scenario_id != MOVING_HANDOFF_SCENARIO_ID:
+            return
+
+        east_m, north_m = moving_person_position(self.simulation_time)
+        latitude, longitude = local_m_to_lat_lon(east_m, north_m)
+
+        for truth_object in self.truth_objects:
+            if bool(truth_object.get("moving", False)):
+                truth_object["latitude"] = latitude
+                truth_object["longitude"] = longitude
+                truth_object["east_m"] = east_m
+                truth_object["north_m"] = north_m
+                truth_object["trajectory"] = moving_person_trajectory()
 
     def _update_flight_trail_locked(self) -> None:
         while self.next_trail_sample_time <= self.simulation_time:
@@ -818,7 +946,7 @@ class DroneSimulator:
             return DroneStatus(
                 schema_version=SCHEMA_VERSION,
                 app_build=APPLICATION_BUILD,
-                scenario_name=SCENARIO_NAME,
+                scenario_name=MOVING_HANDOFF_SCENARIO_NAME if self.scenario_id == MOVING_HANDOFF_SCENARIO_ID else SCENARIO_NAME,
                 scenario_seed=self.scenario_seed,
                 id=self.drone_id,
                 name=self.name,
@@ -851,11 +979,16 @@ class DroneSimulator:
     def truth_payload(self) -> dict[str, object]:
         with self.lock:
             self._advance_locked()
+            self._refresh_moving_truth_objects_locked()
             return {
                 "schema_version": SCHEMA_VERSION,
                 "app_build": APPLICATION_BUILD,
-                "scenario_name": SCENARIO_NAME,
+                "scenario_name": MOVING_HANDOFF_SCENARIO_NAME if self.scenario_id == MOVING_HANDOFF_SCENARIO_ID else SCENARIO_NAME,
                 "scenario_seed": self.scenario_seed,
+                "scenario_id": self.scenario_id,
+                "scenario_run_id": self.scenario_run_id,
+                "initial_observer_id": self.initial_observer_id,
+                "next_observer_id": self.next_observer_id,
                 "selected_playbook": self.selected_playbook,
                 "playbook_config_version": self.playbook_config_version,
                 "requested_priority_count": self.requested_priority_count,
@@ -877,7 +1010,10 @@ class DroneSimulator:
             objects = []
 
             for item in self.objects.values():
-                self._refresh_fused_object_locked(item)
+                if item.get("tracking_model") == "constant_velocity":
+                    self._refresh_moving_track_payload_locked(item)
+                else:
+                    self._refresh_fused_object_locked(item)
                 object_payload = dict(item)
                 age_seconds = max(0.0, self.simulation_time - float(object_payload["last_seen"]))
                 object_payload["age_seconds"] = age_seconds
@@ -889,8 +1025,12 @@ class DroneSimulator:
             return {
                 "schema_version": SCHEMA_VERSION,
                 "app_build": APPLICATION_BUILD,
-                "scenario_name": SCENARIO_NAME,
+                "scenario_name": MOVING_HANDOFF_SCENARIO_NAME if self.scenario_id == MOVING_HANDOFF_SCENARIO_ID else SCENARIO_NAME,
                 "scenario_seed": self.scenario_seed,
+                "scenario_id": self.scenario_id,
+                "scenario_run_id": self.scenario_run_id,
+                "initial_observer_id": self.initial_observer_id,
+                "next_observer_id": self.next_observer_id,
                 "drone_id": self.drone_id,
                 "drone_name": self.name,
                 "simulation_time": self.simulation_time,
@@ -910,6 +1050,8 @@ class DroneSimulator:
                 ),
                 "unresolved_observation_count": len(self.unresolved_observations),
                 "unresolved_observations": list(self.unresolved_observations.values())[-25:],
+                "moving_report_buffer_depth": len(self.moving_report_buffer),
+                "moving_rejected_report_count": self.moving_rejected_report_count,
             }
 
     def control_payload(self) -> dict[str, object]:
@@ -917,8 +1059,12 @@ class DroneSimulator:
             return {
                 "schema_version": SCHEMA_VERSION,
                 "app_build": APPLICATION_BUILD,
-                "scenario_name": SCENARIO_NAME,
+                "scenario_name": MOVING_HANDOFF_SCENARIO_NAME if self.scenario_id == MOVING_HANDOFF_SCENARIO_ID else SCENARIO_NAME,
                 "scenario_seed": self.scenario_seed,
+                "scenario_id": self.scenario_id,
+                "scenario_run_id": self.scenario_run_id,
+                "initial_observer_id": self.initial_observer_id,
+                "next_observer_id": self.next_observer_id,
                 "drone_id": self.drone_id,
                 "paused": self.paused,
                 "sharing_enabled": self.sharing_enabled,
@@ -926,6 +1072,7 @@ class DroneSimulator:
                 "playbook_config_version": self.playbook_config_version,
                 "requested_priority_count": self.requested_priority_count,
                 "priority_object_count": self.priority_object_count,
+                "simulation_time": self.simulation_time,
                 "observation_count": len(self.observations),
                 "object_count": len(self.objects),
                 "response_task": self._visible_response_task_locked(),
@@ -944,6 +1091,19 @@ class DroneSimulator:
     def set_sharing_enabled(self, sharing_enabled: bool) -> None:
         with self.lock:
             self.sharing_enabled = sharing_enabled
+
+    def set_simulation_time(self, simulation_time: float) -> bool:
+        if not math.isfinite(simulation_time):
+            return False
+
+        with self.lock:
+            if simulation_time < self.simulation_time:
+                return False
+
+            self.simulation_time = simulation_time
+            self.last_wall_time = time.monotonic()
+            self._process_moving_report_buffer_locked()
+            return True
 
     def set_playbook(self, selected_playbook: str, config_version: int | None = None) -> bool:
         if selected_playbook not in ENABLED_PLAYBOOKS:
@@ -973,6 +1133,10 @@ class DroneSimulator:
         scenario_seed: int | None = None,
         requested_priority_count: int | None = None,
         selected_playbook: str | None = None,
+        scenario_id: str | None = None,
+        initial_observer_id: int | None = None,
+        next_observer_id: int | None = None,
+        scenario_run_id: str | None = None,
     ) -> None:
         with self.lock:
             if scenario_seed is not None:
@@ -984,9 +1148,37 @@ class DroneSimulator:
             if selected_playbook is not None:
                 self.selected_playbook = selected_playbook if selected_playbook in ENABLED_PLAYBOOKS else DEFAULT_PLAYBOOK
 
-            self.priority_object_count = resolve_priority_object_count(self.scenario_seed, self.requested_priority_count)
+            if scenario_id is not None:
+                self.scenario_id = scenario_id if scenario_id in AVAILABLE_SCENARIOS else DEFAULT_SCENARIO_ID
+
+            candidate_initial_observer_id = self.initial_observer_id
+            candidate_next_observer_id = self.next_observer_id
+
+            if initial_observer_id is not None and initial_observer_id in DRONE_PROFILES:
+                candidate_initial_observer_id = initial_observer_id
+
+            if next_observer_id is not None and next_observer_id in DRONE_PROFILES:
+                candidate_next_observer_id = next_observer_id
+
+            if candidate_next_observer_id == candidate_initial_observer_id:
+                candidate_next_observer_id = next(
+                    candidate_id
+                    for candidate_id in sorted(DRONE_PROFILES)
+                    if candidate_id != candidate_initial_observer_id
+                )
+
+            self.initial_observer_id = candidate_initial_observer_id
+            self.next_observer_id = candidate_next_observer_id
+
+            self.scenario_run_id = scenario_run_id or new_run_id(self.scenario_seed)
+            self.node_session_id = f"{self.drone_id}-{uuid.uuid4().hex[:12]}"
+            self.priority_object_count = (
+                0
+                if self.scenario_id == MOVING_HANDOFF_SCENARIO_ID
+                else resolve_priority_object_count(self.scenario_seed, self.requested_priority_count)
+            )
             self.routes = generate_patrol_routes(self.scenario_seed)
-            self.truth_objects = generate_ground_truth_objects(self.scenario_seed, self.requested_priority_count)
+            self.truth_objects = generate_ground_truth_objects(self.scenario_seed, self.requested_priority_count, self.scenario_id)
             self.last_wall_time = time.monotonic()
             self.simulation_time = 0.0
             self.flight_trail.clear()
@@ -997,6 +1189,11 @@ class DroneSimulator:
             self.objects.clear()
             self.track_to_object.clear()
             self.unresolved_observations.clear()
+            self.moving_report_buffer.clear()
+            self.moving_report_ids.clear()
+            self.moving_committed_report_ids.clear()
+            self.moving_rejected_report_count = 0
+            self.moving_processing_epoch = -math.inf
             self.response_tasks.clear()
             self.response_task_queue.clear()
             self.active_response_task_id = None
@@ -1054,6 +1251,8 @@ class DroneSimulator:
             if self.paused:
                 return []
 
+            self._refresh_moving_truth_objects_locked()
+
             for truth_object in self.truth_objects:
                 latitude = float(truth_object["latitude"])
                 longitude = float(truth_object["longitude"])
@@ -1093,7 +1292,7 @@ class DroneSimulator:
 
                 observation = Observation(
                     id=observation_id,
-                    scenario_run_id=f"{self.scenario_seed}",
+                    scenario_run_id=self.scenario_run_id,
                     source_drone_id=self.drone_id,
                     source_drone_name=self.name,
                     source_color=self.color,
@@ -1109,7 +1308,15 @@ class DroneSimulator:
                     classification_score=score,
                     covariance=covariance,
                     priority_evidence=priority_evidence,
+                    measurement_type=MOVING_TRACK_REPORT_TYPE if bool(truth_object.get("moving", False)) else "point",
                     object_id=f"{sensor_model.sensor_id}:{source_track_id}",
+                    report_schema_version=TRACK_REPORT_SCHEMA_VERSION if bool(truth_object.get("moving", False)) else "legacy-observation-v1",
+                    source_node_session_id=self.node_session_id,
+                    report_id=observation_id,
+                    state_epoch=float(observation_time_bucket),
+                    sensor_track_status="active",
+                    simulated=True,
+                    supporting_observation_ids=[observation_id],
                 )
 
                 if self._apply_observation_locked(observation):
@@ -1229,6 +1436,19 @@ class DroneSimulator:
             priority_evidence=payload.get("priority_evidence") if isinstance(payload.get("priority_evidence"), dict) else None,
             measurement_type=str(payload.get("measurement_type", "point")),
             object_id=str(payload.get("object_id", "")),
+            report_schema_version=str(payload.get("report_schema_version", "legacy-observation-v1")),
+            source_node_session_id=str(payload.get("source_node_session_id", "")),
+            report_id=str(payload.get("report_id", payload.get("id", ""))),
+            state_epoch=float(payload["state_epoch"]) if payload.get("state_epoch") is not None else None,
+            velocity_east_mps=float(payload["velocity_east_mps"]) if payload.get("velocity_east_mps") is not None else None,
+            velocity_north_mps=float(payload["velocity_north_mps"]) if payload.get("velocity_north_mps") is not None else None,
+            state_covariance=payload.get("state_covariance") if isinstance(payload.get("state_covariance"), list) else None,  # type: ignore[arg-type]
+            sensor_track_status=str(payload.get("sensor_track_status", "active")),
+            simulated=bool(payload.get("simulated", True)),
+            supporting_observation_ids=[
+                str(item)
+                for item in payload.get("supporting_observation_ids", [])
+            ] if isinstance(payload.get("supporting_observation_ids"), list) else None,
         )
 
     def _diagnostics_locked(self) -> dict[str, object]:
@@ -1260,6 +1480,16 @@ class DroneSimulator:
             "current_mode": self._current_mode_locked(),
             "assigned_objective": self._assigned_objective_locked(),
             "response_limitation_note": RESPONSE_LIMITATION_NOTE,
+            "moving_tracking": {
+                "report_schema_version": TRACK_REPORT_SCHEMA_VERSION,
+                "buffer_seconds": MOVING_TRACK_BUFFER_SECONDS,
+                "buffer_limit": MOVING_TRACK_BUFFER_LIMIT,
+                "tracked_seconds": MOVING_TRACK_TRACKED_SECONDS,
+                "lost_seconds": MOVING_TRACK_LOST_SECONDS,
+                "rejected_reports": self.moving_rejected_report_count,
+                "buffer_depth": len(self.moving_report_buffer),
+                "notes": "Constant-velocity Kalman filter; local identity continuity is mocked. Real image-based tracking is outside this increment.",
+            },
         }
 
     def _make_discovered_priorities_available_locked(self) -> None:
@@ -1387,10 +1617,10 @@ class DroneSimulator:
         return f"{observation.source_drone_id}:{observation.sensor_id}:{observation.source_track_id}"
 
     def _validate_observation_locked(self, observation: Observation) -> bool:
-        if observation.measurement_type != "point":
+        if observation.measurement_type not in {"point", MOVING_TRACK_REPORT_TYPE}:
             return False
 
-        if observation.scenario_run_id != str(self.scenario_seed):
+        if observation.scenario_run_id != self.scenario_run_id:
             return False
 
         if not all(
@@ -1398,6 +1628,13 @@ class DroneSimulator:
             for value in (observation.east_m, observation.north_m, observation.latitude, observation.longitude)
         ):
             return False
+
+        if observation.measurement_type == MOVING_TRACK_REPORT_TYPE:
+            if observation.report_schema_version != TRACK_REPORT_SCHEMA_VERSION:
+                return False
+
+            if observation.state_epoch is None or not math.isfinite(observation.state_epoch):
+                return False
 
         return is_valid_covariance(observation.covariance)
 
@@ -1502,6 +1739,13 @@ class DroneSimulator:
             "measurement_frame": observation.measurement_frame,
             "measurement_type": observation.measurement_type,
             "object_id": observation.object_id,
+            "report_schema_version": observation.report_schema_version,
+            "report_id": observation.report_id or observation.id,
+            "source_node_session_id": observation.source_node_session_id,
+            "state_epoch": observation.state_epoch,
+            "sensor_track_status": observation.sensor_track_status,
+            "simulated": observation.simulated,
+            "supporting_observation_ids": observation.supporting_observation_ids or [],
             "raw_observation": asdict(observation),
         }
 
@@ -1573,6 +1817,9 @@ class DroneSimulator:
         object_map["teammate_sourced"] = any(source != self.drone_id for source in historical_sources)
 
     def _apply_observation_locked(self, observation: Observation) -> bool:
+        if observation.measurement_type == MOVING_TRACK_REPORT_TYPE:
+            return self._buffer_moving_report_locked(observation)
+
         if observation.id in self.observations:
             self.duplicate_observations_ignored += 1
             self._record_observation_trace_locked(observation, "duplicate_ignored", None, "Observation ID already retained by this node.")
@@ -1658,6 +1905,351 @@ class DroneSimulator:
             self._ensure_response_task_locked(observation, object_map)
 
         return True
+
+    def _buffer_moving_report_locked(self, observation: Observation) -> bool:
+        if observation.id in self.observations or observation.id in self.moving_report_ids or observation.id in self.moving_committed_report_ids:
+            self.duplicate_observations_ignored += 1
+            self._record_observation_trace_locked(observation, "duplicate_ignored", None, "Moving point-track report ID already retained by this node.")
+            return False
+
+        if not self._validate_observation_locked(observation):
+            self.validation_rejects += 1
+            self._record_observation_trace_locked(observation, "rejected", None, "Moving point-track report failed schema, run, timestamp, finite-value, or covariance validation.")
+            return False
+
+        if float(observation.state_epoch or observation.timestamp) < self.moving_processing_epoch:
+            self.moving_rejected_report_count += 1
+            self.observations[observation.id] = observation
+            self._record_observation_trace_locked(observation, "rejected_delayed", None, "Moving point-track report arrived older than the committed processing epoch.")
+            return False
+
+        self.moving_report_ids.add(observation.id)
+        self.moving_report_buffer.append(observation)
+        self.observations[observation.id] = observation
+
+        if len(self.moving_report_buffer) > MOVING_TRACK_BUFFER_LIMIT:
+            overflow = sorted(
+                self.moving_report_buffer,
+                key=lambda report: (
+                    float(report.state_epoch or report.timestamp),
+                    int(report.source_drone_id),
+                    str(report.sensor_id),
+                    str(report.report_id or report.id),
+                ),
+            )[0]
+            self.moving_report_buffer.remove(overflow)
+            self.moving_report_ids.discard(overflow.id)
+            self.moving_rejected_report_count += 1
+            self._record_observation_trace_locked(overflow, "rejected_buffer_overflow", None, "Moving point-track reorder buffer overflowed.")
+
+        return True
+
+    def _moving_candidate_gate_d2_locked(self, object_map: dict[str, object], observation: Observation) -> float:
+        state = object_map["filter_state"]  # type: ignore[assignment]
+        covariance = object_map["filter_covariance"]  # type: ignore[assignment]
+        predicted_state, predicted_covariance = predict_state(
+            state,  # type: ignore[arg-type]
+            covariance,  # type: ignore[arg-type]
+            float(object_map["filter_epoch"]),
+            float(observation.state_epoch or observation.timestamp),
+        )
+        _residual, _innovation_covariance, d2 = innovation_for_position(
+            predicted_state,
+            predicted_covariance,
+            (observation.east_m, observation.north_m),
+            observation.covariance,
+        )
+        return d2
+
+    def _select_moving_association_locked(self, observation: Observation) -> str | None:
+        track_key = self._track_key(observation)
+        continuity_object_id = self.track_to_object.get(track_key)
+
+        if continuity_object_id is not None:
+            object_map = self.objects.get(continuity_object_id)
+
+            if object_map is None:
+                self.track_to_object.pop(track_key, None)
+            elif object_map.get("tracking_model") == "constant_velocity" and object_map["label"] == observation.label:
+                d2 = self._moving_candidate_gate_d2_locked(object_map, observation)
+
+                if d2 <= ASSOCIATION_GATE_D2:
+                    return continuity_object_id
+
+                self._record_unresolved_locked(observation, "moving_track_continuity_spatial_rejection", d2)
+                return None
+
+        candidates: list[tuple[float, str]] = []
+        for object_id, object_map in self.objects.items():
+            if object_map.get("tracking_model") != "constant_velocity" or object_map["label"] != observation.label:
+                continue
+
+            try:
+                d2 = self._moving_candidate_gate_d2_locked(object_map, observation)
+            except ValueError:
+                continue
+
+            if d2 <= ASSOCIATION_GATE_D2:
+                candidates.append((d2, object_id))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        best_d2, best_object_id = candidates[0]
+
+        if len(candidates) > 1:
+            second_d2, _second_object_id = candidates[1]
+
+            if second_d2 - best_d2 <= ASSOCIATION_AMBIGUITY_D2_DELTA:
+                self._record_unresolved_locked(observation, "moving_ambiguous_association", best_d2)
+                return None
+
+        return best_object_id
+
+    def _process_moving_report_buffer_locked(self) -> None:
+        if not self.moving_report_buffer:
+            return
+
+        eligible_cutoff = self.simulation_time - MOVING_TRACK_BUFFER_SECONDS
+        eligible = [
+            report
+            for report in self.moving_report_buffer
+            if float(report.state_epoch or report.timestamp) <= eligible_cutoff
+        ]
+
+        if not eligible:
+            return
+
+        for report in sorted(
+            eligible,
+            key=lambda item: (
+                float(item.state_epoch or item.timestamp),
+                int(item.source_drone_id),
+                str(item.sensor_id),
+                str(item.report_id or item.id),
+            ),
+        ):
+            if report not in self.moving_report_buffer:
+                continue
+
+            self.moving_report_buffer.remove(report)
+            self.moving_report_ids.discard(report.id)
+            self._commit_moving_report_locked(report)
+
+    def _commit_moving_report_locked(self, observation: Observation) -> bool:
+        report_epoch = float(observation.state_epoch or observation.timestamp)
+
+        if report_epoch < self.moving_processing_epoch:
+            self.moving_rejected_report_count += 1
+            self._record_observation_trace_locked(observation, "rejected_delayed", None, "Moving point-track report was older than the committed processing epoch.")
+            return False
+
+        associated_object_id = self._select_moving_association_locked(observation)
+
+        if associated_object_id is None and observation.id in self.unresolved_observations:
+            self._record_observation_trace_locked(observation, "unresolved", None, "Moving report accepted but not associated to a local moving track.")
+            return False
+
+        if associated_object_id is None:
+            associated_object_id = self._new_local_object_id_locked(observation)
+            filter_state, filter_covariance = initialize_track(observation.east_m, observation.north_m, observation.covariance)
+            self.objects[associated_object_id] = {
+                "local_object_id": associated_object_id,
+                "object_id": associated_object_id,
+                "label": observation.label,
+                "tracking_model": "constant_velocity",
+                "motion_class": "moving_person",
+                "latitude": observation.latitude,
+                "longitude": observation.longitude,
+                "east_m": observation.east_m,
+                "north_m": observation.north_m,
+                "predicted_east_m": observation.east_m,
+                "predicted_north_m": observation.north_m,
+                "velocity_east_mps": 0.0,
+                "velocity_north_mps": 0.0,
+                "classification_score": observation.classification_score,
+                "covariance": observation.covariance,
+                "state_covariance": filter_covariance,
+                "uncertainty_m": horizontal_uncertainty_m(filter_covariance),
+                "first_seen": report_epoch,
+                "last_seen": report_epoch,
+                "last_measurement_east_m": observation.east_m,
+                "last_measurement_north_m": observation.north_m,
+                "last_measurement_at": report_epoch,
+                "filter_epoch": report_epoch,
+                "filter_state": filter_state,
+                "filter_covariance": filter_covariance,
+                "sources": [],
+                "source_names": [],
+                "historical_sources": [],
+                "historical_source_names": [],
+                "source_track_ids": [],
+                "own_sensor": False,
+                "teammate_sourced": False,
+                "observation_count": 0,
+                "observation_ids": [],
+                "active_contribution_count": 0,
+                "contributions": {},
+                "measurements": [],
+                "track_trail": [],
+                "track_status": "tracked",
+                "prediction_age_seconds": 0.0,
+                "last_measurement_age_seconds": 0.0,
+                "priority": False,
+                "priority_evidence": None,
+                "priority_signature": None,
+            }
+        else:
+            object_map = self.objects[associated_object_id]
+            predicted_state, predicted_covariance = predict_state(
+                object_map["filter_state"],  # type: ignore[arg-type]
+                object_map["filter_covariance"],  # type: ignore[arg-type]
+                float(object_map["filter_epoch"]),
+                report_epoch,
+            )
+            updated_state, updated_covariance, _d2 = update_with_position(
+                predicted_state,
+                predicted_covariance,
+                (observation.east_m, observation.north_m),
+                observation.covariance,
+            )
+            object_map["filter_state"] = updated_state
+            object_map["filter_covariance"] = updated_covariance
+            object_map["filter_epoch"] = report_epoch
+
+        object_map = self.objects[associated_object_id]
+        if "filter_state" not in object_map:
+            object_map["filter_state"], object_map["filter_covariance"] = initialize_track(observation.east_m, observation.north_m, observation.covariance)
+            object_map["filter_epoch"] = report_epoch
+
+        state = object_map["filter_state"]  # type: ignore[assignment]
+        covariance = object_map["filter_covariance"]  # type: ignore[assignment]
+        object_map["east_m"] = float(state[0])  # type: ignore[index]
+        object_map["north_m"] = float(state[1])  # type: ignore[index]
+        object_map["predicted_east_m"] = float(state[0])  # type: ignore[index]
+        object_map["predicted_north_m"] = float(state[1])  # type: ignore[index]
+        object_map["velocity_east_mps"] = float(state[2])  # type: ignore[index]
+        object_map["velocity_north_mps"] = float(state[3])  # type: ignore[index]
+        latitude, longitude = local_m_to_lat_lon(float(state[0]), float(state[1]))  # type: ignore[index]
+        object_map["latitude"] = latitude
+        object_map["longitude"] = longitude
+        object_map["state_covariance"] = covariance
+        object_map["covariance"] = [[covariance[0][0], covariance[0][1]], [covariance[1][0], covariance[1][1]]]  # type: ignore[index]
+        object_map["uncertainty_m"] = horizontal_uncertainty_m(covariance)  # type: ignore[arg-type]
+        object_map["classification_score"] = max(float(object_map["classification_score"]), observation.classification_score)
+        object_map["last_seen"] = report_epoch
+        object_map["last_measurement_at"] = report_epoch
+        object_map["last_measurement_east_m"] = observation.east_m
+        object_map["last_measurement_north_m"] = observation.north_m
+        object_map["first_seen"] = min(float(object_map["first_seen"]), report_epoch)
+        object_map["observation_count"] = int(object_map["observation_count"]) + 1
+        object_map["observation_ids"] = [*list(object_map["observation_ids"]), observation.id]
+        object_map["track_trail"] = [
+            *[
+                point
+                for point in object_map.get("track_trail", [])  # type: ignore[union-attr]
+                if report_epoch - float(point["timestamp"]) <= MOVING_TRACK_TRAIL_SECONDS
+            ],
+            {"east_m": float(state[0]), "north_m": float(state[1]), "timestamp": report_epoch},  # type: ignore[index]
+        ]
+
+        contribution_key = f"{self._track_key(observation)}:{observation.id}"
+        contributions = object_map["contributions"]  # type: ignore[assignment]
+        contributions[contribution_key] = self._contribution_from_observation(observation)  # type: ignore[index]
+        self.track_to_object[self._track_key(observation)] = associated_object_id
+        self.unique_observations_accepted += 1
+        self.moving_committed_report_ids.add(observation.id)
+        self.moving_processing_epoch = max(self.moving_processing_epoch, report_epoch)
+        self._refresh_moving_track_payload_locked(object_map)
+        self._record_observation_trace_locked(observation, "accepted", associated_object_id, "Moving point-track report updated this node's constant-velocity track.")
+        return True
+
+    def _refresh_moving_track_payload_locked(self, object_map: dict[str, object]) -> None:
+        state = object_map["filter_state"]  # type: ignore[assignment]
+        covariance = object_map["filter_covariance"]  # type: ignore[assignment]
+        predicted_state, predicted_covariance = predict_state(
+            state,  # type: ignore[arg-type]
+            covariance,  # type: ignore[arg-type]
+            float(object_map["filter_epoch"]),
+            self.simulation_time,
+        )
+        predicted_latitude, predicted_longitude = local_m_to_lat_lon(predicted_state[0], predicted_state[1])
+        contributions = object_map["contributions"]  # type: ignore[assignment]
+        historical_sources = {
+            int(contribution["source_drone_id"])
+            for contribution in contributions.values()  # type: ignore[union-attr]
+        }
+        historical_source_names = {
+            str(contribution["source_drone_name"])
+            for contribution in contributions.values()  # type: ignore[union-attr]
+        }
+        recent_contributions = [
+            contribution
+            for contribution in contributions.values()  # type: ignore[union-attr]
+            if self.simulation_time - float(contribution["timestamp"]) <= MOVING_TRACK_TRACKED_SECONDS
+        ]
+        recent_sources = {int(contribution["source_drone_id"]) for contribution in recent_contributions}
+        recent_source_names = {str(contribution["source_drone_name"]) for contribution in recent_contributions}
+        source_track_ids = sorted({
+            f"{contribution['source_drone_name']}:{contribution['sensor_id']}:{contribution['source_track_id']}"
+            for contribution in contributions.values()  # type: ignore[union-attr]
+        })
+        status = moving_lifecycle(float(object_map["last_measurement_at"]), self.simulation_time)
+        object_map["predicted_east_m"] = predicted_state[0]
+        object_map["predicted_north_m"] = predicted_state[1]
+        object_map["latitude"] = predicted_latitude
+        object_map["longitude"] = predicted_longitude
+        object_map["velocity_east_mps"] = predicted_state[2]
+        object_map["velocity_north_mps"] = predicted_state[3]
+        object_map["state_covariance"] = predicted_covariance
+        object_map["covariance"] = [[predicted_covariance[0][0], predicted_covariance[0][1]], [predicted_covariance[1][0], predicted_covariance[1][1]]]
+        object_map["uncertainty_m"] = horizontal_uncertainty_m(predicted_covariance)
+        object_map["track_status"] = status
+        object_map["prediction_age_seconds"] = max(0.0, self.simulation_time - float(object_map["filter_epoch"]))
+        object_map["last_measurement_age_seconds"] = max(0.0, self.simulation_time - float(object_map["last_measurement_at"]))
+        object_map["sources"] = sorted(recent_sources)
+        object_map["source_names"] = sorted(recent_source_names)
+        object_map["historical_sources"] = sorted(historical_sources)
+        object_map["historical_source_names"] = sorted(historical_source_names)
+        object_map["source_track_ids"] = source_track_ids
+        object_map["active_contribution_count"] = len(recent_contributions)
+        object_map["measurements"] = sorted(
+            list(contributions.values()),  # type: ignore[union-attr]
+            key=lambda contribution: (
+                float(contribution["timestamp"]),
+                int(contribution["source_drone_id"]),
+                str(contribution["sensor_id"]),
+                str(contribution["source_track_id"]),
+            ),
+        )[-40:]
+        object_map["own_sensor"] = self.drone_id in historical_sources
+        object_map["teammate_sourced"] = any(source != self.drone_id for source in historical_sources)
+        object_map["handoff_timeline"] = self._moving_handoff_timeline_locked(object_map)
+
+    def _moving_handoff_timeline_locked(self, object_map: dict[str, object]) -> list[dict[str, str]]:
+        measurements = object_map.get("measurements", [])
+        if not measurements:
+            return []
+
+        first = measurements[0]  # type: ignore[index]
+        recent_sources = list(object_map.get("source_names", []))
+        historical_sources = list(object_map.get("historical_source_names", []))
+        events = [{"state": "Acquired", "detail": f"Acquired by {first['source_drone_name']}"}]
+
+        if len(recent_sources) > 1:
+            events.append({"state": "Overlap", "detail": f"Overlapping observations: {', '.join(recent_sources)}"})
+
+        if len(historical_sources) > 1 and recent_sources:
+            events.append({"state": "Continued", "detail": f"Coverage continued by {', '.join(recent_sources)}"})
+
+        status = str(object_map.get("track_status", "tracked"))
+        if status == "coasting":
+            events.append({"state": "Coasting", "detail": "Coasting from prediction; no fresh accepted measurement."})
+        elif status == "lost":
+            events.append({"state": "Lost", "detail": "Track lost; prediction is retained only as historical context."})
+
+        return events
 
     def _record_peer_payload_bytes_locked(self, byte_count: int, direction: str) -> None:
         if byte_count <= 0:
@@ -1889,8 +2481,8 @@ class DroneSimulator:
         owner_drone_name: object,
     ) -> tuple[int, int, str]:
         precedence = {
-            "cancelled": 5,
-            "released": 3,
+            "cancelled": 6,
+            "released": 5,
             "orbiting": 4,
             "transitioning": 3,
             "reported": 2,
@@ -2068,7 +2660,8 @@ class DroneSimulator:
             task["election_deadline"] = self.simulation_time + TASK_ELECTION_SECONDS
             task["playbook_config_version"] = self.playbook_config_version
             task["updated_at"] = self.simulation_time
-            task["owner_task_state"] = None
+            if task.get("owner_task_state") != "released":
+                task["owner_task_state"] = None
             self.active_response_task_id = task_id
             claim = self._task_claim_payload_locked(task)
             self.claims.setdefault(task_id, {})[self.drone_id] = claim
@@ -2077,7 +2670,8 @@ class DroneSimulator:
             task["status"] = "queued"
             task["playbook_config_version"] = self.playbook_config_version
             task["updated_at"] = self.simulation_time
-            task["owner_task_state"] = None
+            if task.get("owner_task_state") != "released":
+                task["owner_task_state"] = None
             self.response_task_queue.append(task_id)
 
     def _reconcile_eligible_work_locked(self) -> None:
@@ -2593,18 +3187,51 @@ class DroneRequestHandler(http.server.BaseHTTPRequestHandler):
                 else None
             )
 
+            scenario_id = str(payload["scenario"]) if "scenario" in payload else None
+            initial_observer_id = int(payload["initial_observer_id"]) if "initial_observer_id" in payload else None
+            next_observer_id = int(payload["next_observer_id"]) if "next_observer_id" in payload else None
+
             if "scenario_seed" in payload:
-                self.simulator.reset(int(payload["scenario_seed"]), requested_priority_count, selected_playbook)
+                scenario_seed = int(payload["scenario_seed"])
+                self.simulator.reset(
+                    scenario_seed,
+                    requested_priority_count,
+                    selected_playbook,
+                    scenario_id,
+                    initial_observer_id,
+                    next_observer_id,
+                    str(payload.get("scenario_run_id", new_run_id(scenario_seed))),
+                )
             elif bool(payload.get("new_random_scenario", False)):
-                self.simulator.reset(time.time_ns() % 1_000_000_000, requested_priority_count, selected_playbook)
+                next_seed = time.time_ns() % 1_000_000_000
+                self.simulator.reset(
+                    next_seed,
+                    requested_priority_count,
+                    selected_playbook,
+                    scenario_id,
+                    initial_observer_id,
+                    next_observer_id,
+                    str(payload.get("scenario_run_id", new_run_id(next_seed))),
+                )
             elif bool(payload.get("reset", False)) or bool(payload.get("restart_scenario", False)):
-                self.simulator.reset(None, requested_priority_count, selected_playbook)
+                self.simulator.reset(
+                    None,
+                    requested_priority_count,
+                    selected_playbook,
+                    scenario_id,
+                    initial_observer_id,
+                    next_observer_id,
+                    str(payload.get("scenario_run_id", new_run_id(self.simulator.scenario_seed))),
+                )
 
             if "paused" in payload:
                 self.simulator.set_paused(bool(payload["paused"]))
 
             if "sharing_enabled" in payload:
                 self.simulator.set_sharing_enabled(bool(payload["sharing_enabled"]))
+
+            if "simulation_time" in payload:
+                self.simulator.set_simulation_time(float(payload["simulation_time"]))
 
             if "playbook" in payload:
                 self.simulator.set_playbook(
@@ -2671,6 +3298,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULT_SCENARIO_SEED)
     parser.add_argument("--priority-count", type=int, default=RANDOM_PRIORITY_OBJECT_COUNT)
     parser.add_argument("--playbook", choices=sorted(SUPPORTED_PLAYBOOKS), default=DEFAULT_PLAYBOOK)
+    parser.add_argument("--scenario", choices=sorted(AVAILABLE_SCENARIOS), default=DEFAULT_SCENARIO_ID)
+    parser.add_argument("--initial-observer-id", type=int, choices=sorted(DRONE_PROFILES), default=DEFAULT_INITIAL_OBSERVER_ID)
+    parser.add_argument("--next-observer-id", type=int, choices=sorted(DRONE_PROFILES), default=DEFAULT_NEXT_OBSERVER_ID)
+    parser.add_argument("--scenario-run-id", default=None)
     return parser.parse_args()
 
 
@@ -2685,6 +3316,10 @@ def main() -> int:
         args.playbook,
         args.host,
         args.port,
+        args.scenario,
+        args.initial_observer_id,
+        args.next_observer_id,
+        args.scenario_run_id,
     )
 
     stop_event = threading.Event()
@@ -2714,7 +3349,7 @@ def main() -> int:
 
         print(
             f"{args.name} running at http://{args.host}:{args.port}/status "
-            f"pid={os.getpid()} build={APPLICATION_BUILD} scenario={SCENARIO_NAME!r} seed={args.seed}",
+            f"pid={os.getpid()} build={APPLICATION_BUILD} scenario={args.scenario!r} seed={args.seed} run={DroneRequestHandler.simulator.scenario_run_id}",
             flush=True,
         )
 

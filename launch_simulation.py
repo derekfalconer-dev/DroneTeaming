@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from pathlib import Path
 
@@ -27,6 +28,10 @@ SCENARIO_NAME = "Seeded noisy overlapping moving-search patrol"
 DEFAULT_SCENARIO_SEED = 20261106
 RANDOM_PRIORITY_OBJECT_COUNT = 0
 DEFAULT_PLAYBOOK = "report_continue"
+DEFAULT_SCENARIO_ID = "seeded_stationary_patrol"
+MOVING_HANDOFF_SCENARIO_ID = "moving_person_handoff"
+DEFAULT_INITIAL_OBSERVER_ID = 1
+DEFAULT_NEXT_OBSERVER_ID = 2
 DRONE_SPECS = (
     {"id": 1, "name": "Red", "color": "#ef4444"},
     {"id": 2, "name": "Blue", "color": "#3b82f6"},
@@ -445,12 +450,68 @@ DASHBOARD_HTML = r"""<!doctype html>
       font-size: 0.85rem;
       margin: 0.5rem 0;
     }
+
+    .compact-header {
+      align-items: center;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      justify-content: space-between;
+      margin: 1rem 0;
+      padding: 0.8rem 1rem;
+    }
+
+    .compact-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .status-banner {
+      background: #7f1d1d;
+      border: 1px solid #f87171;
+      border-radius: 10px;
+      color: #fee2e2;
+      font-weight: 700;
+      margin: 0.75rem 0;
+      padding: 0.75rem;
+    }
+
+    .evidence-grid {
+      display: grid;
+      gap: 0.35rem;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      margin-top: 0.5rem;
+    }
+
+    .verification {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 0.35rem 0.5rem;
+    }
   </style>
 </head>
 <body>
   <h1>Drone Simulation Dashboard</h1>
   <p><strong>Three independent drone programs. Simulated sensors. Real peer network messages. Each drone maintains its own map.</strong></p>
   <p>Three independent moving drones maintain node-local belief maps, sense only within their moving camera footprints, and exchange original observations over peer TCP transport.</p>
+
+  <section class="compact-header" id="compact-header">
+    <div>
+      <strong id="compact-scenario-name">Scenario loading…</strong>
+      <span id="compact-run-state" class="pill">running</span>
+      <span id="compact-elapsed-time" class="pill">0.0 s</span>
+    </div>
+    <div class="compact-actions">
+      <button id="compact-pause-button" type="button">Pause</button>
+      <button id="compact-replay-button" type="button">Replay current scenario</button>
+    </div>
+  </section>
+  <div id="action-error-banner" class="status-banner" hidden></div>
 
   <section class="controls" id="shared-controls">
     <button id="pause-button" type="button">Pause</button>
@@ -547,7 +608,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="control-panel" id="scenario-control-panel">
         <h3>Scenario configuration</h3>
         <button id="reset-button" type="button">Restart scenario</button>
-        <button id="new-scenario-button" type="button">New random scenario</button>
+        <button id="new-scenario-button" type="button">New random selected scenario</button>
+        <button id="handoff-demo-button" type="button">Run handoff demo</button>
         <label class="pill">Priority object count
           <select id="priority-count-select">
             <option value="0" selected>Random (1–5)</option>
@@ -558,7 +620,28 @@ DASHBOARD_HTML = r"""<!doctype html>
             <option value="5">5</option>
           </select>
         </label>
-        <span class="control-note">Applies on the next Restart scenario or New random scenario. Changing this does not reset the current run.</span>
+        <label class="pill">Scenario
+          <select id="scenario-select">
+            <option value="seeded_stationary_patrol" selected>Seeded stationary patrol</option>
+            <option value="moving_person_handoff">Jogging person handoff</option>
+          </select>
+        </label>
+        <label class="pill">Initial observer
+          <select id="initial-observer-select">
+            <option value="1" selected>Red</option>
+            <option value="2">Blue</option>
+            <option value="3">Green</option>
+          </select>
+        </label>
+        <label class="pill">Next observer
+          <select id="next-observer-select">
+            <option value="1">Red</option>
+            <option value="2" selected>Blue</option>
+            <option value="3">Green</option>
+          </select>
+        </label>
+        <div id="handoff-demo-feedback" class="control-note">Handoff demo seed: pending dashboard initialization.</div>
+        <span class="control-note">Scenario and observer selectors apply on the next Restart scenario or New random selected scenario. They shape coverage only and do not provide estimator identity hints.</span>
       </div>
       <canvas id="truth-map" class="truth-canvas" width="1100" height="520"></canvas>
       <div id="truth-details" class="details"></div>
@@ -578,6 +661,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <script>
     const drones = __DRONES_JSON__;
+    const HANDOFF_DEMO_SEED = 2026110601;
+    const HANDOFF_DEMO_SECONDS = 95;
     const grid = document.getElementById("drone-grid");
     const state = {
       statuses: new Map(),
@@ -593,6 +678,10 @@ DASHBOARD_HTML = r"""<!doctype html>
       requestedPriorityCount: 0,
       priorityObjectCount: 0,
       priorityDiscoveredCount: 0,
+      scenarioId: "seeded_stationary_patrol",
+      scenarioRunId: null,
+      initialObserverId: 1,
+      nextObserverId: 2,
       responseTask: null,
       responseTasks: [],
       responseQueueDepth: 0,
@@ -626,6 +715,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       selectionMessage: "",
       activeTab: "team",
       playbookSelectDirty: false,
+      scenarioConfigDirty: false,
+      handoffDemoRunStatus: "idle",
+      handoffConfigStatus: "not_configured",
+      handoffDemoError: "",
+      handoffDemoAckMessage: "",
+      handoffDemoFinishPauseRequested: false,
+      handoffObjectIdsByDrone: new Map(),
+      handoffEvidence: new Map(),
     };
 
     function createCard(drone) {
@@ -745,13 +842,25 @@ DASHBOARD_HTML = r"""<!doctype html>
       state.scenarioSeed = state.truth.scenario_seed;
       state.appBuild = state.truth.app_build || "unknown";
       state.selectedPlaybook = state.truth.selected_playbook || "report_continue";
+      state.scenarioId = state.truth.scenario_id || state.scenarioId;
+      state.scenarioRunId = state.truth.scenario_run_id || state.scenarioRunId;
+      state.initialObserverId = Number(state.truth.initial_observer_id || state.initialObserverId);
+      state.nextObserverId = Number(state.truth.next_observer_id || state.nextObserverId);
       state.playbookConfigVersion = Number(state.truth.playbook_config_version || state.playbookConfigVersion || 0);
       state.requestedPriorityCount = state.truth.requested_priority_count || 0;
       state.priorityObjectCount = state.truth.priority_object_count || 0;
       state.priorityDiscoveredCount = state.truth.priority_discovered_count || 0;
       state.orbitRadiusM = state.truth.orbit_radius_m || 0;
 
-      const runKey = `${state.scenarioSeed}:${state.selectedPlaybook}:${state.requestedPriorityCount}`;
+      const runKey = [
+        state.scenarioId,
+        state.scenarioRunId,
+        state.scenarioSeed,
+        state.selectedPlaybook,
+        state.requestedPriorityCount,
+        state.initialObserverId,
+        state.nextObserverId,
+      ].join(":");
 
       if (state.currentRunKey && state.currentRunKey !== runKey) {
         state.taskSnapshotsByDrone.clear();
@@ -1030,6 +1139,16 @@ DASHBOARD_HTML = r"""<!doctype html>
           : "None currently usable";
       const age = target.ageSeconds === null || target.ageSeconds === undefined ? "—" : `${target.ageSeconds.toFixed(1)} s`;
       const priority = object.priority ? "yes" : "no";
+      const movingDetails = object.tracking_model === "constant_velocity"
+        ? `
+            <dt>Track state</dt><dd>${escapeHtml(object.track_status || "tracked")}</dd>
+            <dt>Prediction age</dt><dd>${Number(object.prediction_age_seconds || 0).toFixed(1)} s</dd>
+            <dt>Last measurement age</dt><dd>${Number(object.last_measurement_age_seconds || 0).toFixed(1)} s</dd>
+            <dt>Velocity</dt><dd>${Number(object.velocity_east_mps || 0).toFixed(2)} m/s E, ${Number(object.velocity_north_mps || 0).toFixed(2)} m/s N</dd>
+            <dt>Local object ID</dt><dd>${escapeHtml(object.local_object_id || object.object_id || "—")}</dd>
+            <dt>Source-local tracks</dt><dd>${escapeHtml((object.source_track_ids || []).join(", ") || "—")}</dd>
+          `
+        : "";
 
       return `
         <div class="control-panel">
@@ -1040,6 +1159,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <dt>Observed by</dt><dd>${escapeHtml(observedBy)}</dd>
             <dt>Recent sources</dt><dd>${escapeHtml(recentSources)}</dd>
             <dt>Age</dt><dd>${escapeHtml(age)}</dd>
+            ${movingDetails}
           </dl>
         </div>
         ${observationInspectorHtml(target)}
@@ -1252,11 +1372,39 @@ DASHBOARD_HTML = r"""<!doctype html>
       const labelRects = [];
 
       for (const object of state.truth.objects) {
+        if (object.moving && object.trajectory) {
+          ctx.strokeStyle = "#f472b6";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          object.trajectory.forEach((point, index) => {
+            const latitude = 37.7752 + (point.north_m / 111111);
+            const longitude = -122.4230 + (point.east_m / metersPerDegLon(37.7752));
+            const projected = project({ latitude, longitude }, bounds, canvas);
+            if (index === 0) {
+              ctx.moveTo(projected.x, projected.y);
+            } else {
+              ctx.lineTo(projected.x, projected.y);
+            }
+          });
+          ctx.stroke();
+        }
         if ((!state.showBackgroundTruthObjects && !object.priority) || (state.priorityOnly && !object.priority)) {
           continue;
         }
         const position = project(object, bounds, canvas);
-        if (object.priority) {
+        if (object.moving) {
+          ctx.fillStyle = "#f472b6";
+          ctx.strokeStyle = "#fdf2f8";
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.moveTo(position.x, position.y - 12);
+          ctx.lineTo(position.x + 12, position.y);
+          ctx.lineTo(position.x, position.y + 12);
+          ctx.lineTo(position.x - 12, position.y);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+        } else if (object.priority) {
           ctx.fillStyle = "#facc15";
           ctx.strokeStyle = "#f97316";
           ctx.lineWidth = 3;
@@ -1410,6 +1558,45 @@ DASHBOARD_HTML = r"""<!doctype html>
           drawCovarianceEllipse(ctx, canvas, bounds, object, object.covariance, "#f8fafc");
         }
 
+        if (object.tracking_model === "constant_velocity") {
+          const statusColors = { tracked: "#f472b6", coasting: "#fbbf24", lost: "#64748b" };
+          const color = statusColors[object.track_status] || "#f472b6";
+          ctx.strokeStyle = color;
+          ctx.fillStyle = `${color}66`;
+          ctx.lineWidth = 4;
+
+          for (const point of object.track_trail || []) {
+            const latitude = 37.7752 + (point.north_m / 111111);
+            const longitude = -122.4230 + (point.east_m / metersPerDegLon(37.7752));
+            const trailPosition = project({ latitude, longitude }, bounds, canvas);
+            ctx.beginPath();
+            ctx.arc(trailPosition.x, trailPosition.y, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
+
+          ctx.beginPath();
+          ctx.moveTo(position.x, position.y - 12);
+          ctx.lineTo(position.x + 12, position.y);
+          ctx.lineTo(position.x, position.y + 12);
+          ctx.lineTo(position.x - 12, position.y);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+
+          const velocityScale = 10;
+          const velocityEnd = localMetricDeltaToCanvas(
+            object,
+            Number(object.velocity_east_mps || 0) * velocityScale,
+            Number(object.velocity_north_mps || 0) * velocityScale,
+            bounds,
+            canvas,
+          );
+          ctx.beginPath();
+          ctx.moveTo(position.x, position.y);
+          ctx.lineTo(position.x + velocityEnd.x, position.y + velocityEnd.y);
+          ctx.stroke();
+        }
+
         if (object.priority) {
           ctx.strokeStyle = "#facc15";
           ctx.lineWidth = 4;
@@ -1495,10 +1682,15 @@ DASHBOARD_HTML = r"""<!doctype html>
         return;
       }
 
+      const timeline = activeDetail.object.handoff_timeline || [];
       inspector.innerHTML = `
         <div class="control-panel">
           <h3>${escapeHtml(droneNameForId(activeDetail.droneId))} belief object</h3>
           ${objectDetailHtml(activeDetail)}
+          ${timeline.length ? `
+            <h3>Moving handoff timeline</h3>
+            <ul>${timeline.map((event) => `<li><strong>${escapeHtml(event.state)}</strong>: ${escapeHtml(event.detail)}</li>`).join("")}</ul>
+          ` : ""}
         </div>
       `;
       restoreJsonUiState();
@@ -1868,14 +2060,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     function compareAssignmentReports(left, right) {
       const leftKey = [
         assignmentEpoch(left.task),
-        reportAuthority(left),
         assignmentRevision(left.task),
+        reportAuthority(left),
         taskUpdateTime(left.task),
       ];
       const rightKey = [
         assignmentEpoch(right.task),
-        reportAuthority(right),
         assignmentRevision(right.task),
+        reportAuthority(right),
         taskUpdateTime(right.task),
       ];
 
@@ -2033,8 +2225,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     function arrangeDashboardTabs() {
-      document.getElementById("tab-team").appendChild(document.getElementById("belief-display-card"));
       document.getElementById("tab-team").appendChild(document.getElementById("map-grid-section"));
+      document.getElementById("tab-team").appendChild(document.getElementById("belief-display-card"));
       document.getElementById("tab-team").appendChild(document.getElementById("shared-inspector-card"));
       document.getElementById("tab-team").appendChild(document.getElementById("assignment-card"));
       document.getElementById("tab-truth").appendChild(document.getElementById("truth-card"));
@@ -2199,6 +2391,153 @@ DASHBOARD_HTML = r"""<!doctype html>
       refreshMapDetailPanels();
     }
 
+    function verificationLabel(status) {
+      return status === "verified"
+        ? "Verified"
+        : status === "failed"
+          ? "Failed"
+          : status === "pending"
+            ? "Pending"
+            : "Not evaluated";
+    }
+
+    function rememberEvidence(key, status, detail) {
+      const previous = state.handoffEvidence.get(key);
+
+      if (previous && previous.status === "verified" && status !== "failed") {
+        return previous;
+      }
+
+      const evidence = { status, detail };
+      state.handoffEvidence.set(key, evidence);
+      return evidence;
+    }
+
+    function evaluateHandoffEvidence() {
+      if (state.scenarioId !== "moving_person_handoff") {
+        return new Map();
+      }
+
+      const initialName = droneNameForId(state.initialObserverId);
+      const nextName = droneNameForId(state.nextObserverId);
+      const onlineDroneIds = new Set(state.statuses.keys());
+      const movingObjectsByDrone = new Map();
+
+      for (const [droneId, belief] of state.beliefs.entries()) {
+        movingObjectsByDrone.set(
+          droneId,
+          (belief.objects || []).filter((object) => object.tracking_model === "constant_velocity"),
+        );
+      }
+
+      const allMeasurements = [...movingObjectsByDrone.values()]
+        .flat()
+        .flatMap((object) => object.measurements || [])
+        .filter((measurement) => String(measurement.scenario_run_id || "") === String(state.scenarioRunId || ""));
+
+      const acquired = allMeasurements.some((measurement) => Number(measurement.source_drone_id) === state.initialObserverId);
+      const nextAccepted = allMeasurements.some((measurement) => Number(measurement.source_drone_id) === state.nextObserverId);
+      const trackedObjects = [...movingObjectsByDrone.values()].flat();
+      const lifecycleStates = new Set(trackedObjects.map((object) => String(object.track_status || "")));
+      const thirdDroneId = drones
+        .map((drone) => drone.id)
+        .find((droneId) => droneId !== state.initialObserverId && droneId !== state.nextObserverId);
+      const thirdObjects = movingObjectsByDrone.get(thirdDroneId) || [];
+      const thirdRemoteTrack = thirdObjects.some((object) => (
+        !object.own_sensor
+        && Boolean(object.teammate_sourced)
+        && (object.historical_sources || []).some((sourceId) => [state.initialObserverId, state.nextObserverId].includes(Number(sourceId)))
+      ));
+
+      let idsPreserved = onlineDroneIds.size > 0;
+      for (const droneId of onlineDroneIds) {
+        const candidate = (movingObjectsByDrone.get(droneId) || []).find((object) => {
+          const sources = new Set((object.historical_sources || []).map(Number));
+          return sources.has(state.initialObserverId) && sources.has(state.nextObserverId);
+        });
+
+        if (!candidate) {
+          idsPreserved = false;
+          continue;
+        }
+
+        const priorId = state.handoffObjectIdsByDrone.get(droneId);
+        const currentId = String(candidate.local_object_id || candidate.object_id || "");
+
+        if (priorId && priorId !== currentId) {
+          idsPreserved = false;
+        } else if (currentId) {
+          state.handoffObjectIdsByDrone.set(droneId, currentId);
+        }
+      }
+
+      rememberEvidence(
+        "initial_acquired",
+        acquired ? "verified" : "pending",
+        acquired ? `Accepted evidence from ${initialName}.` : `Waiting for accepted evidence from ${initialName}.`,
+      );
+      rememberEvidence(
+        "next_accepted",
+        nextAccepted ? "verified" : "pending",
+        nextAccepted ? `Accepted evidence from ${nextName}.` : `Waiting for accepted evidence from ${nextName}.`,
+      );
+      rememberEvidence(
+        "id_preserved",
+        idsPreserved && acquired && nextAccepted ? "verified" : "pending",
+        idsPreserved && acquired && nextAccepted
+          ? "The same local mapped-object ID is retained after both observer sources contribute."
+          : "Waiting for both observer sources on each reporting node without local object-ID churn.",
+      );
+      rememberEvidence(
+        "third_remote",
+        thirdRemoteTrack ? "verified" : "pending",
+        thirdRemoteTrack
+          ? `${droneNameForId(thirdDroneId)} maintains a remotely learned moving track.`
+          : `${droneNameForId(thirdDroneId)} has not yet retained a remote moving track for this run.`,
+      );
+      rememberEvidence(
+        "coasting",
+        lifecycleStates.has("coasting") || lifecycleStates.has("lost") ? "verified" : "pending",
+        lifecycleStates.has("coasting") || lifecycleStates.has("lost")
+          ? "Estimator entered coasting after measurements stopped."
+          : "Coasting has not been observed yet.",
+      );
+      rememberEvidence(
+        "lost",
+        lifecycleStates.has("lost") ? "verified" : "pending",
+        lifecycleStates.has("lost")
+          ? "Estimator transitioned to lost after the configured timeout."
+          : "Lost transition has not been observed yet.",
+      );
+
+      return state.handoffEvidence;
+    }
+
+    function handoffEvidenceSummaryHtml() {
+      if (state.scenarioId !== "moving_person_handoff") {
+        return "";
+      }
+
+      const evidence = evaluateHandoffEvidence();
+      const labels = [
+        ["initial_acquired", "Acquired by initial observer"],
+        ["next_accepted", "Reports accepted from next observer"],
+        ["id_preserved", "Mapped-object ID preserved"],
+        ["third_remote", "Third node remote track"],
+        ["coasting", "Coasting after measurements stopped"],
+        ["lost", "Lost after timeout"],
+      ];
+
+      return `
+        <div class="evidence-grid">
+          ${labels.map(([key, label]) => {
+            const item = evidence.get(key) || { status: "not_evaluated", detail: "" };
+            return `<div class="verification"><strong>${escapeHtml(label)}:</strong> ${escapeHtml(verificationLabel(item.status))}<br><span class="control-note">${escapeHtml(item.detail)}</span></div>`;
+          }).join("")}
+        </div>
+      `;
+    }
+
     function renderAssignments() {
       const details = document.getElementById("assignment-details");
       const rows = buildAssignmentRows();
@@ -2244,6 +2583,107 @@ DASHBOARD_HTML = r"""<!doctype html>
       `;
     }
 
+    function handoffStageFromEvidence() {
+      if (state.scenarioId !== "moving_person_handoff") {
+        return "Handoff demo is not active.";
+      }
+
+      const acceptedMeasurements = [];
+      const trackStatuses = new Set();
+
+      for (const belief of state.beliefs.values()) {
+        for (const object of belief.objects || []) {
+          if (object.tracking_model !== "constant_velocity") {
+            continue;
+          }
+
+          if (object.track_status) {
+            trackStatuses.add(String(object.track_status));
+          }
+
+          for (const measurement of object.measurements || []) {
+            if (String(measurement.scenario_run_id || "") === String(state.scenarioRunId || "")) {
+              acceptedMeasurements.push(measurement);
+            }
+          }
+        }
+      }
+
+      if (acceptedMeasurements.length === 0) {
+        return "Waiting for accepted moving-track evidence.";
+      }
+
+      const sourceIds = new Set(acceptedMeasurements.map((measurement) => Number(measurement.source_drone_id)));
+      const initialName = droneNameForId(state.initialObserverId);
+      const nextName = droneNameForId(state.nextObserverId);
+
+      if (trackStatuses.has("lost")) {
+        return `Accepted tracking evidence retained; latest track lifecycle is lost after ${initialName} → ${nextName}.`;
+      }
+
+      if (sourceIds.has(state.initialObserverId) && sourceIds.has(state.nextObserverId)) {
+        return `Accepted tracking evidence from ${initialName} and ${nextName}; handoff/overlap confirmed.`;
+      }
+
+      if (sourceIds.has(state.nextObserverId)) {
+        return `Accepted next-observer tracking evidence from ${nextName}; waiting for continuity evidence.`;
+      }
+
+      if (sourceIds.has(state.initialObserverId)) {
+        return `Accepted initial-observer tracking evidence from ${initialName}; waiting for ${nextName}.`;
+      }
+
+      return `Accepted tracking evidence from ${[...sourceIds].map(droneNameForId).join(", ")}.`;
+    }
+
+    function renderHandoffDemoFeedback() {
+      const feedback = document.getElementById("handoff-demo-feedback");
+      const button = document.getElementById("handoff-demo-button");
+      const banner = document.getElementById("action-error-banner");
+
+      if (!feedback || !button) {
+        return;
+      }
+
+      const observerPair = `${droneNameForId(state.initialObserverId)} → ${droneNameForId(state.nextObserverId)}`;
+      const demoTime = Number(state.truth.simulation_time || 0);
+      const isHandoffScenario = state.scenarioId === "moving_person_handoff";
+      const finished = isHandoffScenario && demoTime >= HANDOFF_DEMO_SECONDS;
+      const runStatus = state.handoffConfigStatus === "error" || state.handoffDemoRunStatus === "error"
+        ? "error"
+        : state.handoffDemoRunStatus === "configuring"
+          ? "configuring"
+          : state.handoffDemoRunStatus === "finished" || finished
+            ? "finished"
+            : state.paused
+              ? "paused"
+              : isHandoffScenario
+                ? "running"
+                : "not running";
+
+      button.textContent = finished || state.handoffDemoRunStatus === "finished" ? "Replay handoff demo" : "Run handoff demo";
+      button.disabled = state.handoffDemoRunStatus === "configuring";
+
+      if (banner) {
+        banner.hidden = !state.handoffDemoError;
+        banner.textContent = state.handoffDemoError ? `Action error: ${state.handoffDemoError}` : "";
+      }
+
+      feedback.innerHTML = [
+        `Handoff demo seed: <strong>${HANDOFF_DEMO_SEED}</strong>`,
+        `Configuration: <strong>${escapeHtml(state.handoffConfigStatus)}</strong>`,
+        `Scenario: <strong>${isHandoffScenario ? "Jogging person handoff" : state.scenarioName}</strong>`,
+        `Observer pair: <strong>${escapeHtml(observerPair)}</strong>`,
+        `Demo time: <strong>${demoTime.toFixed(1)} s</strong>`,
+        `Run status: <strong>${escapeHtml(runStatus)}</strong>`,
+        `Stage: <strong>${escapeHtml(handoffStageFromEvidence())}</strong>`,
+        state.sharingEnabled ? "<strong>Sharing enabled</strong>" : "<strong>Sharing disabled</strong>",
+        state.handoffDemoAckMessage ? escapeHtml(state.handoffDemoAckMessage) : "",
+        state.handoffDemoError ? `Error: ${escapeHtml(state.handoffDemoError)}` : "",
+        handoffEvidenceSummaryHtml(),
+      ].filter(Boolean).join(" · ");
+    }
+
     function renderControls() {
       const teamSummary = buildTeamSummary();
       const acknowledgedVersions = drones.map((drone) => {
@@ -2269,22 +2709,54 @@ DASHBOARD_HTML = r"""<!doctype html>
         playbookSelect.value = state.selectedPlaybook;
       }
 
+      document.getElementById("compact-scenario-name").textContent = state.scenarioName;
+      document.getElementById("compact-run-state").textContent = state.handoffDemoRunStatus === "error" || state.handoffConfigStatus === "error"
+        ? "Error"
+        : state.paused
+          ? "Paused"
+          : Number(state.truth.simulation_time || 0) >= HANDOFF_DEMO_SECONDS && state.scenarioId === "moving_person_handoff"
+            ? "Finished"
+            : "Running";
+      document.getElementById("compact-elapsed-time").textContent = `${Number(state.truth.simulation_time || 0).toFixed(1)} s`;
+      document.getElementById("compact-pause-button").textContent = state.paused ? "Resume" : "Pause";
+
+      if (!state.scenarioConfigDirty) {
+        document.getElementById("scenario-select").value = state.scenarioId;
+        document.getElementById("initial-observer-select").value = String(state.initialObserverId);
+        document.getElementById("next-observer-select").value = String(state.nextObserverId);
+        document.getElementById("priority-count-select").value = String(state.requestedPriorityCount || 0);
+      }
+
+      const scenarioSelect = document.getElementById("scenario-select");
+      const selectedScenarioOption = scenarioSelect.selectedOptions && scenarioSelect.selectedOptions.length
+        ? scenarioSelect.selectedOptions[0]
+        : null;
+      const scenarioLabel = selectedScenarioOption
+        ? selectedScenarioOption.textContent
+        : state.scenarioName || state.scenarioId || "selected scenario";
+      document.getElementById("new-scenario-button").textContent = `New random ${scenarioLabel}`;
+
       document.getElementById("sharing-button").textContent = state.sharingEnabled ? "Disable sharing" : "Enable sharing";
       document.getElementById("pause-button").textContent = state.paused ? "Resume" : "Pause";
       document.getElementById("control-state").textContent = `${state.sharingEnabled ? "Sharing on" : "Sharing off"} · ${state.paused ? "paused" : "running"}`;
-      document.getElementById("scenario-state").textContent = `${state.scenarioName} · seed ${state.scenarioSeed} · priority ${state.priorityObjectCount} · playbook ${state.selectedPlaybook} · build ${state.appBuild}`;
+      document.getElementById("scenario-state").textContent = `${state.scenarioName} · seed ${state.scenarioSeed} · run ${state.scenarioRunId || "—"} · priority ${state.priorityObjectCount} · playbook ${state.selectedPlaybook} · build ${state.appBuild}`;
       document.getElementById("task-state").textContent = `${teamSummary.orbiting} orbiting · ${teamSummary.transitioning} transitioning · ${teamSummary.searching} searching · ${teamSummary.queued} queued`;
       document.getElementById("playbook-config-state").textContent = pendingConfig && !applied
         ? `Requested ${pendingConfig.playbook} v${pendingConfig.version} pending · applied ${state.selectedPlaybook} · ${acknowledgedVersions.join(" · ")}`
         : `Applied playbook ${state.selectedPlaybook} · ${acknowledgedVersions.join(" · ")}`;
+      renderHandoffDemoFeedback();
     }
 
-    async function postControl(payload, targetDrones = drones) {
+    async function postControlNoUpdate(payload, targetDrones = drones) {
       await Promise.all(targetDrones.map((drone) => fetchJson(`${drone.url}/control`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       })));
+    }
+
+    async function postControl(payload, targetDrones = drones) {
+      await postControlNoUpdate(payload, targetDrones);
       await updateAll();
     }
 
@@ -2300,6 +2772,22 @@ DASHBOARD_HTML = r"""<!doctype html>
       renderAssignments();
       renderNetwork();
       renderMaps();
+
+      if (
+        state.scenarioId === "moving_person_handoff"
+        && state.handoffDemoRunStatus === "running"
+        && Number(state.truth.simulation_time || 0) >= HANDOFF_DEMO_SECONDS
+        && !state.handoffDemoFinishPauseRequested
+      ) {
+        state.handoffDemoFinishPauseRequested = true;
+        state.handoffDemoRunStatus = "finished";
+        postControlNoUpdate({ paused: true, sharing_enabled: true })
+          .then(updateAll)
+          .catch((error) => {
+            state.handoffDemoError = `Failed to pause completed demo: ${error.message}`;
+            renderControls();
+          });
+      }
     }
 
     document.getElementById("sharing-button").addEventListener("click", () => {
@@ -2310,10 +2798,35 @@ DASHBOARD_HTML = r"""<!doctype html>
       postControl({ paused: !state.paused });
     });
 
+    document.getElementById("compact-pause-button").addEventListener("click", () => {
+      postControl({ paused: !state.paused });
+    });
+
+    document.getElementById("compact-replay-button").addEventListener("click", () => {
+      state.handoffDemoError = "";
+      state.handoffDemoAckMessage = "";
+      state.handoffDemoFinishPauseRequested = false;
+      state.handoffEvidence.clear();
+      state.handoffObjectIdsByDrone.clear();
+      postControl({ restart_scenario: true, ...selectedRunOptions() });
+    });
+
     function selectedRunOptions() {
+      const initialObserverId = Number(document.getElementById("initial-observer-select").value);
+      let nextObserverId = Number(document.getElementById("next-observer-select").value);
+
+      if (nextObserverId === initialObserverId) {
+        nextObserverId = drones.find((drone) => drone.id !== initialObserverId).id;
+        document.getElementById("next-observer-select").value = String(nextObserverId);
+      }
+
       return {
         priority_count: Number(document.getElementById("priority-count-select").value),
         playbook: document.getElementById("playbook-select").value,
+        scenario: document.getElementById("scenario-select").value,
+        initial_observer_id: initialObserverId,
+        next_observer_id: nextObserverId,
+        scenario_run_id: `dashboard-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       };
     }
 
@@ -2332,18 +2845,139 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     document.getElementById("reset-button").addEventListener("click", () => {
+      state.handoffDemoError = "";
+      state.handoffDemoAckMessage = "";
+      state.handoffDemoFinishPauseRequested = false;
       postControl({ restart_scenario: true, ...selectedRunOptions() });
     });
 
     document.getElementById("new-scenario-button").addEventListener("click", () => {
       const scenarioSeed = Math.floor(Date.now() % 1000000000);
+      state.handoffDemoRunStatus = "idle";
+      state.handoffDemoError = "";
+      state.handoffDemoAckMessage = "";
+      state.handoffDemoFinishPauseRequested = false;
       postControl({ scenario_seed: scenarioSeed, ...selectedRunOptions() });
+    });
+
+    function configurationMismatch(payload, expected) {
+      const expectedScenario = expected.scenario_id || expected.scenario;
+      const checks = [
+        [Number(payload.scenario_seed) === Number(expected.scenario_seed), `seed ${payload.scenario_seed}`],
+        [payload.scenario_id === expectedScenario, `scenario ${payload.scenario_id}`],
+        [payload.scenario_run_id === expected.scenario_run_id, `run ${payload.scenario_run_id}`],
+        [Number(payload.initial_observer_id) === Number(expected.initial_observer_id), `initial observer ${payload.initial_observer_id}`],
+        [Number(payload.next_observer_id) === Number(expected.next_observer_id), `next observer ${payload.next_observer_id}`],
+        [payload.selected_playbook === expected.playbook, `playbook ${payload.selected_playbook}`],
+        [Boolean(payload.sharing_enabled) === Boolean(expected.sharing_enabled), `sharing ${payload.sharing_enabled}`],
+        [Boolean(payload.paused) === Boolean(expected.paused), `paused ${payload.paused}`],
+      ];
+      return checks.filter(([passed]) => !passed).map(([_passed, label]) => label).join(", ");
+    }
+
+    async function waitForConfigurationAcknowledgement(expected) {
+      const deadline = Date.now() + 8000;
+      let lastMessage = "Waiting for node acknowledgements.";
+
+      while (Date.now() < deadline) {
+        const results = await Promise.all(drones.map(async (drone) => {
+          try {
+            const payload = await fetchJson(`${drone.url}/control`);
+            const mismatch = configurationMismatch(payload, expected);
+            return mismatch ? `${drone.name}: ${mismatch}` : "";
+          } catch (error) {
+            return `${drone.name}: unavailable`;
+          }
+        }));
+        const failures = results.filter(Boolean);
+
+        if (failures.length === 0) {
+          state.handoffConfigStatus = "verified";
+          state.handoffDemoAckMessage = "All nodes acknowledged handoff demo configuration.";
+          renderControls();
+          return;
+        }
+
+        lastMessage = `Configuring handoff demo · ${failures.join(" · ")}`;
+        state.handoffDemoAckMessage = lastMessage;
+        renderControls();
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+
+      throw new Error(lastMessage);
+    }
+
+    async function runHandoffDemo() {
+      const initialObserverId = Number(document.getElementById("initial-observer-select").value || 1);
+      let nextObserverId = Number(document.getElementById("next-observer-select").value || 2);
+
+      if (nextObserverId === initialObserverId) {
+        nextObserverId = drones.find((drone) => drone.id !== initialObserverId).id;
+        document.getElementById("next-observer-select").value = String(nextObserverId);
+      }
+
+      const version = Math.max(
+        state.playbookConfigVersion + 1,
+        ...[...state.statuses.values()].map((status) => Number(status.playbook_config_version || 0) + 1),
+      );
+      const payload = {
+        restart_scenario: true,
+        scenario_seed: HANDOFF_DEMO_SEED,
+        priority_count: 0,
+        playbook: "report_continue",
+        playbook_config_version: version,
+        scenario: "moving_person_handoff",
+        initial_observer_id: initialObserverId,
+        next_observer_id: nextObserverId,
+        scenario_run_id: `handoff-demo-${HANDOFF_DEMO_SEED}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        paused: true,
+        sharing_enabled: true,
+      };
+
+      state.handoffDemoRunStatus = "configuring";
+      state.handoffConfigStatus = "pending";
+      state.handoffDemoError = "";
+      state.handoffDemoAckMessage = "Sending handoff demo configuration to all nodes.";
+      state.handoffDemoFinishPauseRequested = false;
+      state.handoffEvidence.clear();
+      state.handoffObjectIdsByDrone.clear();
+      state.pendingPlaybookConfig = { playbook: "report_continue", version };
+      state.playbookSelectDirty = false;
+      state.scenarioConfigDirty = false;
+      clearInspectionSelection("Handoff demo replay started. Previous selected object and pinned sensor report were cleared.");
+      renderControls();
+
+      try {
+        await postControlNoUpdate(payload);
+        await waitForConfigurationAcknowledgement(payload);
+        await postControlNoUpdate({ paused: false, sharing_enabled: true });
+        state.handoffDemoRunStatus = "running";
+        state.handoffConfigStatus = "verified";
+        state.handoffDemoAckMessage = "All nodes acknowledged configuration; demo running with sharing enabled.";
+        await updateAll();
+      } catch (error) {
+        state.handoffDemoRunStatus = "error";
+        state.handoffConfigStatus = "error";
+        state.handoffDemoError = error.message;
+        state.handoffDemoAckMessage = "";
+        await updateAll();
+      }
+    }
+
+    document.getElementById("handoff-demo-button").addEventListener("click", () => {
+      runHandoffDemo();
     });
 
     document.getElementById("playbook-select").addEventListener("change", (event) => {
       state.playbookSelectDirty = true;
       applyPlaybookConfiguration(event.target.value);
     });
+
+    for (const id of ["priority-count-select", "scenario-select", "initial-observer-select", "next-observer-select"]) {
+      document.getElementById(id).addEventListener("change", () => {
+        state.scenarioConfigDirty = true;
+      });
+    }
 
     document.getElementById("cancel-response-button").addEventListener("click", () => {
       postControl({ cancel_response: true });
@@ -2574,6 +3208,14 @@ def parse_args() -> argparse.Namespace:
         help="Simulation-only response playbook. orbit_follow is reserved for Stage B.",
     )
     parser.add_argument(
+        "--scenario",
+        choices=(DEFAULT_SCENARIO_ID, MOVING_HANDOFF_SCENARIO_ID),
+        default=DEFAULT_SCENARIO_ID,
+        help="Scenario geometry. Moving handoff is a shared-world tracking scenario, not a playbook.",
+    )
+    parser.add_argument("--initial-observer-id", type=int, choices=(1, 2, 3), default=DEFAULT_INITIAL_OBSERVER_ID)
+    parser.add_argument("--next-observer-id", type=int, choices=(1, 2, 3), default=DEFAULT_NEXT_OBSERVER_ID)
+    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="Start the processes without opening a browser.",
@@ -2602,6 +3244,10 @@ def start_drone_processes(
     scenario_seed: int,
     priority_count: int,
     playbook: str,
+    scenario: str,
+    initial_observer_id: int,
+    next_observer_id: int,
+    scenario_run_id: str,
 ) -> list[subprocess.Popen[str]]:
     drone_script = Path(__file__).with_name("simulated_drone.py")
     processes: list[subprocess.Popen[str]] = []
@@ -2632,6 +3278,14 @@ def start_drone_processes(
                 str(priority_count),
                 "--playbook",
                 playbook,
+                "--scenario",
+                scenario,
+                "--initial-observer-id",
+                str(initial_observer_id),
+                "--next-observer-id",
+                str(next_observer_id),
+                "--scenario-run-id",
+                scenario_run_id,
             ],
             text=True,
         )
@@ -2693,12 +3347,23 @@ def main() -> int:
     print(f"Scenario seed: {DEFAULT_SCENARIO_SEED}")
 
     playbook = args.playbook if args.playbook != "orbit_follow" else DEFAULT_PLAYBOOK
+    initial_observer_id = args.initial_observer_id
+    next_observer_id = args.next_observer_id if args.next_observer_id != initial_observer_id else next(
+        int(spec["id"])
+        for spec in DRONE_SPECS
+        if int(spec["id"]) != initial_observer_id
+    )
+    scenario_run_id = f"launcher-{DEFAULT_SCENARIO_SEED}-{uuid.uuid4().hex[:12]}"
     processes = start_drone_processes(
         args.drone_host,
         drone_ports,
         DEFAULT_SCENARIO_SEED,
         args.priority_count,
         playbook,
+        args.scenario,
+        initial_observer_id,
+        next_observer_id,
+        scenario_run_id,
     )
 
     try:

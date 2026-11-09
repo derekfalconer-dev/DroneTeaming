@@ -13,11 +13,27 @@ import unittest
 import urllib.request
 from pathlib import Path
 
-from simulated_drone import APPLICATION_BUILD, SCENARIO_OBJECT_COUNT
+from moving_tracking import (
+    MOVING_TRACK_LOST_SECONDS,
+    MOVING_TRACK_TRACKED_SECONDS,
+    moving_person_position,
+)
+
+from simulated_drone import (
+    APPLICATION_BUILD,
+    DEFAULT_SCENARIO_ID,
+    DEFAULT_SCENARIO_SEED,
+    MOVING_HANDOFF_SCENARIO_ID,
+    MOVING_TRACK_REPORT_TYPE,
+    PLAYBOOK_REPORT_CONTINUE,
+    SCENARIO_OBJECT_COUNT,
+)
 
 
 HOST = "127.0.0.1"
 POSITION_TOLERANCE_DEG = 0.00002
+HANDOFF_INITIAL_SAMPLE_TIMES = (12.0, 16.0, 20.0, 24.0)
+HANDOFF_NEXT_SAMPLE_TIMES = (56.0, 60.0, 64.0, 68.0)
 
 
 def free_port() -> int:
@@ -127,13 +143,115 @@ class LaunchSimulationPathTest(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
 
+    def wait_for_control_ack(
+        self,
+        expected: dict[str, object],
+        timeout_seconds: float = 8.0,
+    ) -> list[dict[str, object]]:
+        deadline = time.monotonic() + timeout_seconds
+        last_payloads: list[dict[str, object]] = []
+
+        while time.monotonic() < deadline:
+            last_payloads = [fetch_json(f"{url}/control") for url in self.urls]
+            failures = []
+
+            for payload in last_payloads:
+                failures.extend([
+                    payload["scenario_seed"] != expected["scenario_seed"],
+                    payload["scenario_id"] != expected["scenario_id"],
+                    payload["scenario_run_id"] != expected["scenario_run_id"],
+                    payload["initial_observer_id"] != expected["initial_observer_id"],
+                    payload["next_observer_id"] != expected["next_observer_id"],
+                    payload["selected_playbook"] != expected["selected_playbook"],
+                    payload["paused"] != expected["paused"],
+                    payload["sharing_enabled"] != expected["sharing_enabled"],
+                ])
+
+            if not any(failures):
+                return last_payloads
+
+            time.sleep(0.2)
+
+        raise AssertionError(f"Nodes did not acknowledge expected control state; last_payloads={last_payloads!r}")
+
+    def test_handoff_demo_configuration_acknowledges_on_all_processes_and_restart_preserves_it(self) -> None:
+        dashboard_request = urllib.request.Request(f"http://{HOST}:{self.dashboard_port}/")
+        with urllib.request.urlopen(dashboard_request, timeout=2) as response:
+            dashboard_html = response.read().decode("utf-8")
+
+        self.assertIn("handoff-demo-button", dashboard_html)
+        self.assertIn("Run handoff demo", dashboard_html)
+        self.assertIn("2026110601", dashboard_html)
+
+        demo_payload = {
+            "restart_scenario": True,
+            "scenario_seed": 2026110601,
+            "priority_count": 0,
+            "playbook": PLAYBOOK_REPORT_CONTINUE,
+            "scenario": MOVING_HANDOFF_SCENARIO_ID,
+            "initial_observer_id": 3,
+            "next_observer_id": 1,
+            "scenario_run_id": "integration-handoff-demo-run-a",
+            "paused": True,
+            "sharing_enabled": True,
+        }
+        for url in self.urls:
+            fetch_json(f"{url}/control", method="POST", payload=demo_payload)
+
+        acknowledged = self.wait_for_control_ack({
+            "scenario_seed": 2026110601,
+            "scenario_id": MOVING_HANDOFF_SCENARIO_ID,
+            "scenario_run_id": "integration-handoff-demo-run-a",
+            "initial_observer_id": 3,
+            "next_observer_id": 1,
+            "selected_playbook": PLAYBOOK_REPORT_CONTINUE,
+            "paused": True,
+            "sharing_enabled": True,
+        })
+        self.assertEqual(3, len(acknowledged))
+        self.assertTrue(all(payload["observation_count"] == 0 for payload in acknowledged))
+        self.assertTrue(all(payload["object_count"] == 0 for payload in acknowledged))
+        self.assertTrue(all(payload["priority_object_count"] == 0 for payload in acknowledged))
+
+        for url in self.urls:
+            fetch_json(f"{url}/control", method="POST", payload={"paused": False, "sharing_enabled": True})
+
+        time.sleep(0.8)
+        running_status = fetch_json(f"{self.urls[0]}/status")
+        self.assertFalse(running_status["paused"])
+        self.assertTrue(running_status["sharing_enabled"])
+        self.assertGreater(float(running_status["timestamp"]), 0.0)
+
+        restart_payload = {
+            "restart_scenario": True,
+            "scenario_run_id": "integration-handoff-demo-run-b",
+            "paused": True,
+            "sharing_enabled": True,
+        }
+        for url in self.urls:
+            fetch_json(f"{url}/control", method="POST", payload=restart_payload)
+
+        restarted = self.wait_for_control_ack({
+            "scenario_seed": 2026110601,
+            "scenario_id": MOVING_HANDOFF_SCENARIO_ID,
+            "scenario_run_id": "integration-handoff-demo-run-b",
+            "initial_observer_id": 3,
+            "next_observer_id": 1,
+            "selected_playbook": PLAYBOOK_REPORT_CONTINUE,
+            "paused": True,
+            "sharing_enabled": True,
+        })
+        self.assertTrue(all(payload["observation_count"] == 0 for payload in restarted))
+        self.assertTrue(all(payload["object_count"] == 0 for payload in restarted))
+        self.assertEqual("integration-handoff-demo-run-b", fetch_json(f"{self.urls[0]}/truth")["scenario_run_id"])
+
     def test_normal_launcher_path_serves_moving_seeded_scenario(self) -> None:
         dashboard_request = urllib.request.Request(f"http://{HOST}:{self.dashboard_port}/")
         with urllib.request.urlopen(dashboard_request, timeout=2) as response:
             dashboard_html = response.read().decode("utf-8")
             self.assertEqual("no-store", response.headers["Cache-Control"])
 
-        self.assertIn("New random scenario", dashboard_html)
+        self.assertIn("New random selected scenario", dashboard_html)
         self.assertIn("Restart scenario", dashboard_html)
 
         truth = fetch_json(f"{self.urls[0]}/truth")
@@ -162,6 +280,8 @@ class LaunchSimulationPathTest(unittest.TestCase):
 
         fetch_json(f"{self.urls[0]}/control", method="POST", payload={"restart_scenario": True})
         restarted_truth = fetch_json(f"{self.urls[0]}/truth")
+        self.assertEqual(DEFAULT_SCENARIO_ID, restarted_truth["scenario_id"])
+        self.assertEqual(DEFAULT_SCENARIO_SEED, restarted_truth["scenario_seed"])
         self.assertEqual(first_truth_objects, restarted_truth["objects"])
 
         fetch_json(f"{self.urls[0]}/control", method="POST", payload={"scenario_seed": 987654321})
@@ -212,7 +332,11 @@ class PeerPropagationTest(unittest.TestCase):
             self.assertIsNone(process.poll(), f"Drone on port {port} exited")
 
         for url in self.urls:
-            fetch_json(f"{url}/control", method="POST", payload={"reset": True})
+            fetch_json(
+                f"{url}/control",
+                method="POST",
+                payload={"reset": True, "scenario_run_id": "peer-propagation-shared-run"},
+            )
 
     def cleanup_processes(self) -> None:
         for process in self.processes:
@@ -377,6 +501,72 @@ class PeerPropagationTest(unittest.TestCase):
             f"{self.failure_context(url, last_payload)}",
         )
 
+    def url_for_drone_id(self, drone_id: int) -> str:
+        return self.urls[drone_id - 1]
+
+    def set_all_simulation_times(self, simulation_time: float) -> None:
+        for url in self.urls:
+            fetch_json(f"{url}/control", method="POST", payload={"simulation_time": simulation_time})
+
+    def run_handoff_samples(self, sample_times: tuple[float, ...]) -> None:
+        for sample_time in sample_times:
+            self.set_all_simulation_times(sample_time)
+            time.sleep(0.35)
+            self.set_all_simulation_times(sample_time + 1.25)
+            time.sleep(0.25)
+
+    def moving_objects(self, url: str) -> list[dict[str, object]]:
+        return [
+            item
+            for item in fetch_json(f"{url}/objects")["objects"]  # type: ignore[index]
+            if item.get("tracking_model") == "constant_velocity"
+        ]
+
+    def wait_for_moving_objects(
+        self,
+        required_sources: set[int] | None = None,
+        required_status: str | None = None,
+        timeout_seconds: float = 8.0,
+    ) -> dict[str, list[dict[str, object]]]:
+        deadline = time.monotonic() + timeout_seconds
+        last_by_url: dict[str, list[dict[str, object]]] = {}
+
+        while time.monotonic() < deadline:
+            last_by_url = {url: self.moving_objects(url) for url in self.urls}
+            matches = True
+
+            for objects in last_by_url.values():
+                if len(objects) != 1:
+                    matches = False
+                    break
+
+                item = objects[0]
+                sources = {int(source) for source in item["historical_sources"]}  # type: ignore[index]
+                if required_sources is not None and not required_sources.issubset(sources):
+                    matches = False
+                    break
+
+                if required_status is not None and item.get("track_status") != required_status:
+                    matches = False
+                    break
+
+            if matches:
+                return last_by_url
+
+            time.sleep(0.2)
+
+        self.fail(f"Moving objects did not converge; required_sources={required_sources}; required_status={required_status}; last_by_url={last_by_url!r}")
+
+    def assert_moving_accuracy(self, objects_by_url: dict[str, list[dict[str, object]]], simulation_time: float) -> None:
+        truth_east_m, truth_north_m = moving_person_position(simulation_time)
+
+        for url, objects in objects_by_url.items():
+            item = objects[0]
+            position_error_m = ((float(item["predicted_east_m"]) - truth_east_m) ** 2 + (float(item["predicted_north_m"]) - truth_north_m) ** 2) ** 0.5
+            velocity_error_mps = ((float(item["velocity_east_mps"]) - 4.0) ** 2 + float(item["velocity_north_mps"]) ** 2) ** 0.5
+            self.assertLess(position_error_m, 120.0, f"{url} position_error_m={position_error_m:.3f}; object={item!r}")
+            self.assertLess(velocity_error_mps, 14.0, f"{url} velocity_error_mps={velocity_error_mps:.3f}; object={item!r}")
+
     def wait_for_multisource_object(
         self,
         url: str,
@@ -452,6 +642,111 @@ class PeerPropagationTest(unittest.TestCase):
         self.assertEqual(object_map["label"], expected_label)
         self.assertLess(abs(float(object_map["latitude"]) - expected_latitude), POSITION_TOLERANCE_DEG * 80)
         self.assertLess(abs(float(object_map["longitude"]) - expected_longitude), POSITION_TOLERANCE_DEG * 80)
+
+    def test_all_directed_observer_pairs_complete_real_http_moving_handoff(self) -> None:
+        pairs = [
+            (initial_observer_id, next_observer_id)
+            for initial_observer_id in (1, 2, 3)
+            for next_observer_id in (1, 2, 3)
+            if initial_observer_id != next_observer_id
+        ]
+
+        for initial_observer_id, next_observer_id in pairs:
+            with self.subTest(initial_observer_id=initial_observer_id, next_observer_id=next_observer_id):
+                run_id = f"peer-http-handoff-{initial_observer_id}-{next_observer_id}-{time.time_ns()}"
+                for url in self.urls:
+                    fetch_json(
+                        f"{url}/control",
+                        method="POST",
+                        payload={
+                            "restart_scenario": True,
+                            "scenario_seed": DEFAULT_SCENARIO_SEED,
+                            "priority_count": 0,
+                            "playbook": PLAYBOOK_REPORT_CONTINUE,
+                            "scenario": MOVING_HANDOFF_SCENARIO_ID,
+                            "initial_observer_id": initial_observer_id,
+                            "next_observer_id": next_observer_id,
+                            "scenario_run_id": run_id,
+                            "sharing_enabled": True,
+                            "paused": False,
+                            "simulation_time": 0.0,
+                        },
+                    )
+
+                self.run_handoff_samples(HANDOFF_INITIAL_SAMPLE_TIMES)
+                after_initial = self.wait_for_moving_objects({initial_observer_id}, "tracked")
+                initial_ids = {
+                    url: str(objects[0]["local_object_id"])
+                    for url, objects in after_initial.items()
+                }
+                third_drone_id = next(iter({1, 2, 3} - {initial_observer_id, next_observer_id}))
+
+                for drone_id in (1, 2, 3):
+                    item = after_initial[self.url_for_drone_id(drone_id)][0]
+                    sources = {int(source) for source in item["historical_sources"]}  # type: ignore[index]
+                    self.assertEqual({initial_observer_id}, sources, f"drone_id={drone_id}; item={item!r}")
+
+                    if drone_id == initial_observer_id:
+                        self.assertTrue(item["own_sensor"], f"initial observer should own the first local reports; item={item!r}")
+                    else:
+                        self.assertFalse(item["own_sensor"], f"non-initial observer should only have remote initial reports; item={item!r}")
+                        self.assertTrue(item["teammate_sourced"], f"non-initial observer should retain teammate-sourced track; item={item!r}")
+
+                self.run_handoff_samples(HANDOFF_NEXT_SAMPLE_TIMES)
+                after_handoff = self.wait_for_moving_objects({initial_observer_id, next_observer_id}, "tracked")
+                self.assert_moving_accuracy(after_handoff, HANDOFF_NEXT_SAMPLE_TIMES[-1] + 1.25)
+
+                for url, objects in after_handoff.items():
+                    item = objects[0]
+                    self.assertEqual(initial_ids[url], str(item["local_object_id"]))
+                    source_track_ids = list(item["source_track_ids"])  # type: ignore[arg-type]
+                    self.assertGreaterEqual(len(source_track_ids), 2, f"{url} source_track_ids={source_track_ids!r}")
+                    self.assertEqual(len(source_track_ids), len(set(source_track_ids)))
+                    self.assertIn(initial_observer_id, {int(source) for source in item["historical_sources"]})  # type: ignore[index]
+                    self.assertIn(next_observer_id, {int(source) for source in item["historical_sources"]})  # type: ignore[index]
+
+                third_url = self.url_for_drone_id(third_drone_id)
+                third_object = after_handoff[third_url][0]
+                self.assertFalse(third_object["own_sensor"])
+                self.assertTrue(third_object["teammate_sourced"])
+
+                coast_time = HANDOFF_NEXT_SAMPLE_TIMES[-1] + MOVING_TRACK_TRACKED_SECONDS + 1.0
+                self.set_all_simulation_times(coast_time)
+                coasting = self.wait_for_moving_objects({initial_observer_id, next_observer_id}, "coasting")
+                self.assertEqual(initial_ids, {url: str(objects[0]["local_object_id"]) for url, objects in coasting.items()})
+
+                lost_time = HANDOFF_NEXT_SAMPLE_TIMES[-1] + MOVING_TRACK_LOST_SECONDS + 3.0
+                self.set_all_simulation_times(lost_time)
+                lost = self.wait_for_moving_objects({initial_observer_id, next_observer_id}, "lost")
+                self.assertEqual(initial_ids, {url: str(objects[0]["local_object_id"]) for url, objects in lost.items()})
+
+                old_report = next(
+                    measurement["raw_observation"]
+                    for measurement in lost[self.urls[0]][0]["measurements"]  # type: ignore[index]
+                    if measurement["measurement_type"] == MOVING_TRACK_REPORT_TYPE
+                )
+                replay_run_id = f"{run_id}-replay"
+                for url in self.urls:
+                    fetch_json(
+                        f"{url}/control",
+                        method="POST",
+                        payload={
+                            "restart_scenario": True,
+                            "scenario_run_id": replay_run_id,
+                            "sharing_enabled": True,
+                            "paused": False,
+                            "simulation_time": 0.0,
+                        },
+                    )
+
+                rejected = fetch_json(f"{self.urls[0]}/observations", method="POST", payload=old_report)
+                self.assertFalse(rejected["accepted"])
+                self.assertEqual([], self.moving_objects(self.urls[0]))
+
+                self.run_handoff_samples((HANDOFF_INITIAL_SAMPLE_TIMES[0],))
+                replay = self.wait_for_moving_objects({initial_observer_id}, "tracked")
+                replay_measurements = replay[self.urls[0]][0]["measurements"]  # type: ignore[index]
+                self.assertTrue(any(measurement["scenario_run_id"] == replay_run_id for measurement in replay_measurements))
 
     def test_red_and_blue_common_object_converges_to_one_multisource_map_object(self) -> None:
         red_url, blue_url, green_url = self.urls
