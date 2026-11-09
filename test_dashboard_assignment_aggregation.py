@@ -37,20 +37,28 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
                 width: 520,
                 height: 360,
                 getBoundingClientRect() {{ return {{ width: 520, height: id.startsWith("belief-map") ? 420 : 360 }}; }},
-                classList: {{ add() {{}}, remove() {{}} }},
+                classList: {{ add() {{}}, remove() {{}}, toggle() {{}} }},
                 style: {{}},
                 appendChild() {{}},
                 addEventListener() {{}},
+                setAttribute(name, value) {{ this[name] = value; }},
+                getAttribute(name) {{ return this[name] || ""; }},
+                focus() {{}},
+                setSelectionRange(start, end) {{ this.selectionStart = start; this.selectionEnd = end; }},
+                closest() {{ return null; }},
                 getContext() {{
                   return {{
                     clearRect() {{}}, beginPath() {{}}, moveTo() {{}}, lineTo() {{}}, stroke() {{}},
                     fill() {{}}, arc() {{}}, closePath() {{}}, save() {{}}, translate() {{}},
                     rotate() {{}}, restore() {{}}, fillText() {{}}, rect() {{}}, setLineDash() {{}},
-                    ellipse() {{}},
+                    ellipse() {{}}, measureText(value) {{ return {{ width: String(value).length * 6 }}; }},
                   }};
                 }},
                 querySelector() {{
                   return makeElement("query");
+                }},
+                querySelectorAll() {{
+                  return [];
                 }},
               }};
             }}
@@ -65,6 +73,11 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
               createElement(tagName) {{
                 return makeElement(tagName);
               }},
+              querySelectorAll() {{
+                return [];
+              }},
+              addEventListener() {{}},
+              activeElement: null,
             }};
 
             const context = {{
@@ -81,7 +94,10 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
               String,
               fetch: () => new Promise(() => {{}}),
               setInterval() {{}},
-              window: {{ devicePixelRatio: 1 }},
+              setTimeout(callback) {{ callback(); }},
+              window: {{ devicePixelRatio: 1, localStorage: {{ getItem() {{ return null; }}, setItem() {{}} }}, requestAnimationFrame(callback) {{ callback(); }} }},
+              navigator: {{ clipboard: {{ writeText() {{}} }} }},
+              process,
             }};
 
             vm.createContext(context);
@@ -91,17 +107,227 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
             process.stdout.write(JSON.stringify({{
               assignmentDetails: elements.get("assignment-details").innerHTML,
               taskState: elements.get("task-state") ? elements.get("task-state").textContent : "",
+              beliefDetails1: elements.get("belief-details-1") ? elements.get("belief-details-1").innerHTML : "",
+              networkDetails: elements.get("network-details") ? elements.get("network-details").innerHTML : "",
+              networkSummary: elements.get("network-summary") ? elements.get("network-summary").textContent : "",
+              sharedInspector: elements.get("shared-inspector") ? elements.get("shared-inspector").innerHTML : "",
             }}));
             """
         )
 
-        completed = subprocess.run(
-            [node, "-e", runner],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            completed = subprocess.run(
+                [node, "-e", runner],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as error:
+            self.fail(
+                "Dashboard JavaScript regression failed.\n"
+                f"stdout:\n{error.stdout}\n"
+                f"stderr:\n{error.stderr}",
+            )
         return json.loads(completed.stdout)
+
+    def test_served_dashboard_contains_collapsed_team_network_section(self) -> None:
+        self.assertIn("Network &amp; messages", launch_simulation.DASHBOARD_HTML)
+        self.assertIn("Team network", launch_simulation.DASHBOARD_HTML)
+        self.assertIn('id="network-summary"', launch_simulation.DASHBOARD_HTML)
+        self.assertIn('id="network-details"', launch_simulation.DASHBOARD_HTML)
+        self.assertIn('id="tab-network"', launch_simulation.DASHBOARD_HTML)
+        self.assertNotIn("<details open>\n      <summary>Peer HTTP diagnostics</summary>", launch_simulation.DASHBOARD_HTML)
+
+    def test_selected_object_uses_historical_and_recent_sources_from_latest_polled_record(self) -> None:
+        fixture = """
+        state.beliefs.set(1, {
+          simulation_time: 50,
+          unresolved_observation_count: 0,
+          objects: [{
+            local_object_id: "object-a",
+            object_id: "object-a",
+            label: "vehicle",
+            priority: false,
+            stale: true,
+            last_seen: 13,
+            source_names: [],
+            historical_source_names: ["Red", "Blue"],
+            own_sensor: true,
+            teammate_sourced: true,
+            active_contribution_count: 0,
+            measurements: [{
+              observation_id: "obs-a",
+              source_drone_name: "Red",
+              source_drone_id: 1,
+              sensor_id: "eo-red",
+              source_track_id: "track-a",
+              timestamp: 13,
+              classification_score: 0.91,
+              east_m: 25,
+              north_m: 35,
+              covariance: [[64, 0], [0, 36]],
+              scenario_run_id: "20261106",
+              raw_observation: { id: "obs-a", sensor_id: "eo-red", classification_score: 0.91 },
+            }],
+          }],
+        });
+        state.selectedMapObject = {
+          key: "belief:1:object-a",
+          kind: "belief",
+          droneId: 1,
+          object: { label: "vehicle", source_names: [], historical_source_names: [], measurements: [] },
+          ageSeconds: 99,
+        };
+        state.mapHitTargets.set("belief-map-1", [{
+          key: "belief:1:object-a",
+          kind: "belief",
+          droneId: 1,
+          object: state.beliefs.get(1).objects[0],
+          ageSeconds: 37,
+        }]);
+        renderBeliefDetails({ id: 1, name: "Red" });
+        renderSharedInspector();
+        """
+        output = self.run_dashboard_script(fixture)
+
+        self.assertIn("stale · 0 unresolved", output["beliefDetails1"])
+        self.assertIn("Red belief object", output["sharedInspector"])
+        self.assertIn("Observed by", output["sharedInspector"])
+        self.assertIn("Red, Blue", output["sharedInspector"])
+        self.assertIn("Recent sources", output["sharedInspector"])
+        self.assertIn("None — stale", output["sharedInspector"])
+        self.assertIn("SIMULATED SENSOR INPUT", output["sharedInspector"])
+        self.assertIn("Trace this observation", output["sharedInspector"])
+        self.assertIn("classification_score", output["sharedInspector"])
+
+    def test_stale_owner_active_task_contradiction_is_presented_as_historical_not_current(self) -> None:
+        fixture = """
+        const now = Date.now() / 1000;
+
+        state.statuses.set(3, { current_mode: "orbiting", assigned_objective: "sig-antenna" });
+        state.taskSnapshotsByDrone.set(3, {
+          droneId: 3,
+          droneName: "Green",
+          online: true,
+          receivedAt: now,
+          simulationTime: 100,
+          currentMode: "orbiting",
+          assignedObjective: "sig-antenna",
+          responseTask: {
+            task_id: "task-antenna",
+            signature_id: "sig-antenna",
+            object_label: "antenna",
+            assigned_drone_id: 3,
+            assigned_drone_name: "Green",
+            status: "orbiting",
+            revision: 8,
+            playbook_config_version: 4,
+            last_observation_at: 95,
+          },
+          responseTasks: [
+            {
+              task_id: "task-antenna",
+              signature_id: "sig-antenna",
+              object_label: "antenna",
+              assigned_drone_id: 3,
+              assigned_drone_name: "Green",
+              status: "orbiting",
+              revision: 8,
+              playbook_config_version: 4,
+              last_observation_at: 95,
+            },
+            {
+              task_id: "task-vehicle",
+              signature_id: "sig-vehicle",
+              object_label: "vehicle",
+              assigned_drone_id: 3,
+              assigned_drone_name: "Green",
+              status: "assigned_remote",
+              owner_task_state: "orbiting",
+              revision: 6,
+              playbook_config_version: 3,
+              last_observation_at: 70,
+            },
+          ],
+        });
+
+        renderAssignments();
+        renderControls();
+        """
+        output = self.run_dashboard_script(fixture)
+
+        self.assertIn("PRIORITY Antenna", output["assignmentDetails"])
+        self.assertIn("PRIORITY Vehicle", output["assignmentDetails"])
+        self.assertIn("<td>Green</td>", output["assignmentDetails"])
+        self.assertIn("<td>orbiting</td>", output["assignmentDetails"])
+        self.assertIn("<td>Unassigned</td>", output["assignmentDetails"])
+        self.assertIn("<td>reported</td>", output["assignmentDetails"])
+        self.assertIn("historical owner not displayed as current", output["assignmentDetails"])
+        self.assertIn("1 orbiting · 0 transitioning · 0 searching · 0 queued", output["taskState"])
+
+    def test_playbook_selector_initializes_from_acknowledged_backend_state(self) -> None:
+        fixture = """
+        state.selectedPlaybook = "observe_orbit";
+        state.statuses.set(1, { selected_playbook: "observe_orbit", playbook_config_version: 4 });
+        state.statuses.set(2, { selected_playbook: "observe_orbit", playbook_config_version: 4 });
+        state.statuses.set(3, { selected_playbook: "observe_orbit", playbook_config_version: 4 });
+        renderControls();
+        process.stdout.write(JSON.stringify({
+          playbookValue: elements.get("playbook-select").value,
+          playbookState: elements.get("playbook-config-state").textContent,
+        }));
+        process.exit(0);
+        """
+        output = self.run_dashboard_script(fixture)
+
+        self.assertEqual("observe_orbit", output["playbookValue"])
+        self.assertIn("Applied playbook observe_orbit", output["playbookState"])
+
+    def test_network_summary_uses_backend_metrics(self) -> None:
+        fixture = """
+        state.networks.set(1, {
+          node_id: 1,
+          node_name: "Red",
+          hostname: "mac",
+          pid: 123,
+          app_build: "build",
+          api_address: "http://127.0.0.1:9101",
+          configured_peers: ["http://127.0.0.1:9102"],
+          observation_messages_sent: 2,
+          observation_messages_received: 3,
+          claim_messages_sent: 4,
+          claim_messages_received: 5,
+          payload_bytes_sent: 100,
+          payload_bytes_received: 200,
+          payload_bytes_per_second: { sent: 12.5, received: 7.5 },
+          send_failures: 1,
+          duplicate_observations_ignored: 6,
+          validation_rejects: 7,
+          trace_retained_count: 8,
+          trace_retention_limit: 256,
+          trace_evictions: 9,
+          peer_connection_state: [{
+            peer: "http://127.0.0.1:9102",
+            reachability: "recently_reachable",
+            last_rtt_ms: 3.25,
+            last_success_wall_time: 12345,
+            latest_error: null,
+            observation_messages_sent: 2,
+            claim_messages_sent: 4,
+            payload_bytes_sent: 100,
+            send_failures: 1,
+          }],
+        });
+        renderNetwork();
+        """
+        output = self.run_dashboard_script(fixture)
+
+        self.assertIn("1/3 nodes reporting", output["networkSummary"])
+        self.assertIn("20.0 B/s JSON payload only", output["networkSummary"])
+        self.assertIn("1 send failures", output["networkSummary"])
+        self.assertIn("Observation messages", output["networkDetails"])
+        self.assertIn("Task/config messages", output["networkDetails"])
+        self.assertIn("3.3 ms", output["networkDetails"])
 
     def test_owner_reports_override_assigned_remote_peer_snapshots_regardless_of_arrival_order(self) -> None:
         fixture = """

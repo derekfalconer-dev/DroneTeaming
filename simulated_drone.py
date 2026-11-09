@@ -12,11 +12,13 @@ import math
 import os
 import random
 import signal
+import socket
 import socketserver
 import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from dataclasses import asdict, dataclass
 
 
@@ -49,6 +51,8 @@ RESPONSE_LIMITATION_NOTE = (
     "Connected-peer claim convergence is supported, but radio partition recovery, owner-failure "
     "reassignment, moving-object tracking, and orbit-and-follow are future Stage B work."
 )
+OBSERVATION_TRACE_RETENTION = 256
+NETWORK_THROUGHPUT_WINDOW_SECONDS = 5.0
 STALE_AFTER_SECONDS = 6.0
 TRAIL_SAMPLE_INTERVAL_SECONDS = 0.5
 TRAIL_RETENTION_SECONDS = 30.0
@@ -634,6 +638,8 @@ class DroneSimulator:
         scenario_seed: int = DEFAULT_SCENARIO_SEED,
         requested_priority_count: int = RANDOM_PRIORITY_OBJECT_COUNT,
         selected_playbook: str = DEFAULT_PLAYBOOK,
+        api_host: str = "127.0.0.1",
+        api_port: int = 0,
     ) -> None:
         profile = DRONE_PROFILES[drone_id]
         self.drone_id = drone_id
@@ -647,6 +653,10 @@ class DroneSimulator:
         self.requested_priority_count = requested_priority_count
         self.priority_object_count = resolve_priority_object_count(scenario_seed, requested_priority_count)
         self.selected_playbook = selected_playbook if selected_playbook in ENABLED_PLAYBOOKS else DEFAULT_PLAYBOOK
+        self.api_host = api_host
+        self.api_port = api_port
+        self.hostname = socket.gethostname()
+        self.process_id = os.getpid()
         self.playbook_config_version = 0
         self.routes = generate_patrol_routes(scenario_seed)
         self.truth_objects = generate_ground_truth_objects(scenario_seed, requested_priority_count)
@@ -683,6 +693,17 @@ class DroneSimulator:
         self.unique_observations_accepted = 0
         self.duplicate_observations_ignored = 0
         self.validation_rejects = 0
+        self.observation_trace_records: dict[str, dict[str, object]] = {}
+        self.observation_trace_order: deque[str] = deque()
+        self.observation_trace_evictions = 0
+        self.peer_observation_messages_sent = 0
+        self.peer_observation_messages_received = 0
+        self.peer_claim_messages_sent = 0
+        self.peer_claim_messages_received = 0
+        self.peer_payload_bytes_sent = 0
+        self.peer_payload_bytes_received = 0
+        self.peer_payload_byte_events: deque[tuple[float, int, str]] = deque()
+        self.peer_send_failures = 0
         self.most_recent_received_observation_id: str | None = None
         self.most_recent_received_source: str | None = None
         self.most_recent_sent_observation_id: str | None = None
@@ -692,19 +713,29 @@ class DroneSimulator:
                 "state": "not_contacted",
                 "last_error": None,
                 "last_success_time": None,
+                "last_success_wall_time": None,
+                "last_rtt_ms": None,
+                "observation_messages_sent": 0,
+                "claim_messages_sent": 0,
+                "payload_bytes_sent": 0,
+                "send_failures": 0,
+                "latest_error": None,
             }
             for peer in peers
         }
 
-    def _advance_locked(self) -> None:
+    def _advance_locked(self, update_flight_trail: bool = True) -> None:
         now = time.monotonic()
         elapsed = now - self.last_wall_time
         if not self.paused:
             self.simulation_time += elapsed
+            self._reconcile_eligible_work_locked()
             self._resolve_response_tasks_locked()
             self._update_response_guidance_locked(elapsed)
             self._update_return_to_patrol_locked(elapsed)
-            self._update_flight_trail_locked()
+
+            if update_flight_trail:
+                self._update_flight_trail_locked()
         self.last_wall_time = now
 
     def _pose_at_locked(self) -> tuple[float, float, float]:
@@ -919,7 +950,7 @@ class DroneSimulator:
             return False
 
         with self.lock:
-            self._advance_locked()
+            self._advance_locked(update_flight_trail=False)
             next_version = max(self.playbook_config_version + 1, int(config_version or 0))
 
             if selected_playbook == self.selected_playbook and next_version <= self.playbook_config_version:
@@ -930,6 +961,7 @@ class DroneSimulator:
             self.playbook_config_version = next_version
 
             if previous_playbook == PLAYBOOK_REPORT_CONTINUE and selected_playbook == PLAYBOOK_OBSERVE_ORBIT:
+                self.outbound_claims.clear()
                 self._make_discovered_priorities_available_locked()
             elif previous_playbook == PLAYBOOK_OBSERVE_ORBIT and selected_playbook == PLAYBOOK_REPORT_CONTINUE:
                 self._release_active_response_tasks_locked()
@@ -986,6 +1018,17 @@ class DroneSimulator:
             self.unique_observations_accepted = 0
             self.duplicate_observations_ignored = 0
             self.validation_rejects = 0
+            self.observation_trace_records.clear()
+            self.observation_trace_order.clear()
+            self.observation_trace_evictions = 0
+            self.peer_observation_messages_sent = 0
+            self.peer_observation_messages_received = 0
+            self.peer_claim_messages_sent = 0
+            self.peer_claim_messages_received = 0
+            self.peer_payload_bytes_sent = 0
+            self.peer_payload_bytes_received = 0
+            self.peer_payload_byte_events.clear()
+            self.peer_send_failures = 0
             self.most_recent_received_observation_id = None
             self.most_recent_received_source = None
             self.most_recent_sent_observation_id = None
@@ -994,6 +1037,13 @@ class DroneSimulator:
                 peer_state["state"] = "not_contacted"
                 peer_state["last_error"] = None
                 peer_state["last_success_time"] = None
+                peer_state["last_success_wall_time"] = None
+                peer_state["last_rtt_ms"] = None
+                peer_state["observation_messages_sent"] = 0
+                peer_state["claim_messages_sent"] = 0
+                peer_state["payload_bytes_sent"] = 0
+                peer_state["send_failures"] = 0
+                peer_state["latest_error"] = None
 
     def capture_observations(self) -> list[Observation]:
         new_observations: list[Observation] = []
@@ -1069,9 +1119,11 @@ class DroneSimulator:
 
         return new_observations
 
-    def receive_observation(self, payload: dict[str, object]) -> bool:
+    def receive_observation(self, payload: dict[str, object], payload_byte_count: int = 0) -> bool:
         with self.lock:
             self.peer_observations_received += 1
+            self.peer_observation_messages_received += 1
+            self._record_peer_payload_bytes_locked(payload_byte_count, "received")
 
         try:
             observation = self._observation_from_payload(payload)
@@ -1102,22 +1154,34 @@ class DroneSimulator:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
+            started_at = time.monotonic()
 
             try:
                 with urllib.request.urlopen(request, timeout=0.4):
                     pass
             except (OSError, urllib.error.URLError) as error:
                 with self.lock:
+                    self.peer_send_failures += 1
                     self.peer_connection_state[peer]["state"] = "error"
                     self.peer_connection_state[peer]["last_error"] = str(error)
+                    self.peer_connection_state[peer]["latest_error"] = str(error)
+                    self.peer_connection_state[peer]["send_failures"] = int(self.peer_connection_state[peer]["send_failures"]) + 1
                 continue
 
+            elapsed_ms = (time.monotonic() - started_at) * 1000.0
             with self.lock:
                 self.peer_observations_sent += 1
+                self.peer_observation_messages_sent += 1
+                self._record_peer_payload_bytes_locked(len(payload), "sent")
                 self.most_recent_sent_observation_id = observation.id
                 self.peer_connection_state[peer]["state"] = "ok"
                 self.peer_connection_state[peer]["last_error"] = None
+                self.peer_connection_state[peer]["latest_error"] = None
                 self.peer_connection_state[peer]["last_success_time"] = self.simulation_time
+                self.peer_connection_state[peer]["last_success_wall_time"] = time.monotonic()
+                self.peer_connection_state[peer]["last_rtt_ms"] = elapsed_ms
+                self.peer_connection_state[peer]["observation_messages_sent"] = int(self.peer_connection_state[peer]["observation_messages_sent"]) + 1
+                self.peer_connection_state[peer]["payload_bytes_sent"] = int(self.peer_connection_state[peer]["payload_bytes_sent"]) + len(payload)
 
     def redeliver_last_observation(self) -> bool:
         with self.lock:
@@ -1192,6 +1256,7 @@ class DroneSimulator:
             "response_tasks": self._visible_response_tasks_locked(),
             "response_queue_depth": len(self.response_task_queue),
             "orbit_radius_m": ORBIT_RADIUS_M,
+            "network": self._network_payload_locked(),
             "current_mode": self._current_mode_locked(),
             "assigned_objective": self._assigned_objective_locked(),
             "response_limitation_note": RESPONSE_LIMITATION_NOTE,
@@ -1265,6 +1330,7 @@ class DroneSimulator:
             "assigned_drone_name": None,
             "orbit_radius_m": ORBIT_RADIUS_M,
             "revision": 0,
+            "assignment_epoch": 1 if status == "electing" else 0,
             "event": "Previously discovered priority evidence became eligible under observe-and-orbit.",
             "limitation": RESPONSE_LIMITATION_NOTE,
         }
@@ -1304,13 +1370,7 @@ class DroneSimulator:
                 self.outbound_claims.append(self._task_claim_payload_locked(task, "released"))
 
             if task.get("status") in {"transitioning", "orbiting", "assigned_remote", "electing", "queued"}:
-                task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
-                task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
-                task["assigned_drone_id"] = None
-                task["assigned_drone_name"] = None
-                task["status"] = "reported"
-                task["owner_task_state"] = "released"
-                task["updated_at"] = self.simulation_time
+                self._release_current_assignment_locked(task, "released")
                 task["playbook_config_version"] = self.playbook_config_version
 
             if task_id in self.response_task_queue:
@@ -1369,6 +1429,7 @@ class DroneSimulator:
             "north_m": observation.north_m,
             "d2": d2,
         }
+        self._record_observation_trace_locked(observation, "unresolved", None, reason)
 
     def _select_association_locked(self, observation: Observation) -> str | None:
         track_key = self._track_key(observation)
@@ -1437,6 +1498,11 @@ class DroneSimulator:
             "classification_score": observation.classification_score,
             "covariance": observation.covariance,
             "priority_evidence": observation.priority_evidence,
+            "scenario_run_id": observation.scenario_run_id,
+            "measurement_frame": observation.measurement_frame,
+            "measurement_type": observation.measurement_type,
+            "object_id": observation.object_id,
+            "raw_observation": asdict(observation),
         }
 
     def _refresh_fused_object_locked(self, object_map: dict[str, object]) -> None:
@@ -1509,10 +1575,12 @@ class DroneSimulator:
     def _apply_observation_locked(self, observation: Observation) -> bool:
         if observation.id in self.observations:
             self.duplicate_observations_ignored += 1
+            self._record_observation_trace_locked(observation, "duplicate_ignored", None, "Observation ID already retained by this node.")
             return False
 
         if not self._validate_observation_locked(observation):
             self.validation_rejects += 1
+            self._record_observation_trace_locked(observation, "rejected", None, "Observation failed schema, run, finite-value, or covariance validation.")
             return False
 
         track_key = self._track_key(observation)
@@ -1522,6 +1590,7 @@ class DroneSimulator:
         if associated_object_id is None and not create_new_object:
             self.observations[observation.id] = observation
             self.unique_observations_accepted += 1
+            self._record_observation_trace_locked(observation, "unresolved", None, "Accepted but not associated to a local map object.")
             return False
 
         if create_new_object:
@@ -1562,6 +1631,7 @@ class DroneSimulator:
         if prior_contribution is not None and observation.timestamp <= float(prior_contribution["timestamp"]):
             self.duplicate_observations_ignored += 1
             self.observations[observation.id] = observation
+            self._record_observation_trace_locked(observation, "duplicate_ignored", associated_object_id, "Older or equal source-track contribution ignored.")
             return False
 
         contributions[track_key] = self._contribution_from_observation(observation)  # type: ignore[index]
@@ -1582,11 +1652,140 @@ class DroneSimulator:
             object_map["priority_signature"] = str(observation.priority_evidence["signature_id"])
 
         self._refresh_fused_object_locked(object_map)
+        self._record_observation_trace_locked(observation, "accepted", associated_object_id, "Observation contributed to this node's local map.")
 
         if observation.priority_evidence:
             self._ensure_response_task_locked(observation, object_map)
 
         return True
+
+    def _record_peer_payload_bytes_locked(self, byte_count: int, direction: str) -> None:
+        if byte_count <= 0:
+            return
+
+        now = time.monotonic()
+
+        if direction == "sent":
+            self.peer_payload_bytes_sent += byte_count
+        else:
+            self.peer_payload_bytes_received += byte_count
+
+        self.peer_payload_byte_events.append((now, byte_count, direction))
+        self._prune_peer_payload_byte_events_locked(now)
+
+    def _prune_peer_payload_byte_events_locked(self, now: float | None = None) -> None:
+        cutoff = (now if now is not None else time.monotonic()) - NETWORK_THROUGHPUT_WINDOW_SECONDS
+
+        while self.peer_payload_byte_events and self.peer_payload_byte_events[0][0] < cutoff:
+            self.peer_payload_byte_events.popleft()
+
+    def _payload_bytes_per_second_locked(self) -> dict[str, float]:
+        now = time.monotonic()
+        self._prune_peer_payload_byte_events_locked(now)
+        sent = sum(byte_count for _timestamp, byte_count, direction in self.peer_payload_byte_events if direction == "sent")
+        received = sum(byte_count for _timestamp, byte_count, direction in self.peer_payload_byte_events if direction == "received")
+        return {
+            "sent": sent / NETWORK_THROUGHPUT_WINDOW_SECONDS,
+            "received": received / NETWORK_THROUGHPUT_WINDOW_SECONDS,
+        }
+
+    def _record_observation_trace_locked(
+        self,
+        observation: Observation,
+        outcome: str,
+        associated_object_id: str | None,
+        detail: str,
+    ) -> None:
+        if observation.id not in self.observation_trace_records:
+            self.observation_trace_order.append(observation.id)
+
+        self.observation_trace_records[observation.id] = {
+            "observation_id": observation.id,
+            "scenario_run_id": observation.scenario_run_id,
+            "originated_locally": observation.source_drone_id == self.drone_id,
+            "source_drone_id": observation.source_drone_id,
+            "source_drone_name": observation.source_drone_name,
+            "sensor_id": observation.sensor_id,
+            "source_track_id": observation.source_track_id,
+            "outcome": outcome,
+            "detail": detail,
+            "associated_local_object_id": associated_object_id,
+            "trace_recorded_wall_time": time.monotonic(),
+            "trace_recorded_simulation_time": self.simulation_time,
+        }
+
+        while len(self.observation_trace_order) > OBSERVATION_TRACE_RETENTION:
+            evicted_id = self.observation_trace_order.popleft()
+            self.observation_trace_records.pop(evicted_id, None)
+            self.observation_trace_evictions += 1
+
+    def trace_observation_payload(self, observation_id: str) -> dict[str, object]:
+        with self.lock:
+            self._advance_locked()
+            record = self.observation_trace_records.get(observation_id)
+
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "app_build": APPLICATION_BUILD,
+                "drone_id": self.drone_id,
+                "drone_name": self.name,
+                "observation_id": observation_id,
+                "retained_trace_count": len(self.observation_trace_records),
+                "trace_retention_limit": OBSERVATION_TRACE_RETENTION,
+                "trace_evictions": self.observation_trace_evictions,
+                "record": dict(record) if record is not None else None,
+                "status": str(record["outcome"]) if record is not None else "not_seen_or_no_longer_retained",
+            }
+
+    def _peer_reachability_state(self, peer_state: dict[str, object]) -> str:
+        last_success_wall_time = peer_state.get("last_success_wall_time")
+
+        if peer_state.get("state") == "error":
+            return "failing"
+
+        if isinstance(last_success_wall_time, float) and time.monotonic() - last_success_wall_time <= 10.0:
+            return "recently_reachable"
+
+        return "unknown"
+
+    def _network_payload_locked(self) -> dict[str, object]:
+        rates = self._payload_bytes_per_second_locked()
+        peers = []
+
+        for peer_state in self.peer_connection_state.values():
+            item = dict(peer_state)
+            item["reachability"] = self._peer_reachability_state(peer_state)
+            peers.append(item)
+
+        return {
+            "node_id": self.drone_id,
+            "node_name": self.name,
+            "hostname": self.hostname,
+            "pid": self.process_id,
+            "app_build": APPLICATION_BUILD,
+            "api_address": f"http://{self.api_host}:{self.api_port}",
+            "configured_peers": list(self.peers),
+            "peer_connection_state": peers,
+            "observation_messages_sent": self.peer_observation_messages_sent,
+            "observation_messages_received": self.peer_observation_messages_received,
+            "claim_messages_sent": self.peer_claim_messages_sent,
+            "claim_messages_received": self.peer_claim_messages_received,
+            "payload_bytes_sent": self.peer_payload_bytes_sent,
+            "payload_bytes_received": self.peer_payload_bytes_received,
+            "payload_bytes_per_second": rates,
+            "payload_accounting": "JSON payload only; dashboard polling is excluded from peer-traffic counters.",
+            "send_failures": self.peer_send_failures,
+            "duplicate_observations_ignored": self.duplicate_observations_ignored,
+            "validation_rejects": self.validation_rejects,
+            "trace_retention_limit": OBSERVATION_TRACE_RETENTION,
+            "trace_retained_count": len(self.observation_trace_records),
+            "trace_evictions": self.observation_trace_evictions,
+            "wall_time_source": "time.monotonic",
+        }
+
+    def network_payload(self) -> dict[str, object]:
+        with self.lock:
+            return self._network_payload_locked()
 
     def _priority_discovered_count_locked(self) -> int:
         return len(
@@ -1738,6 +1937,7 @@ class DroneSimulator:
             "status": status,
             "task_state": status,
             "revision": revision,
+            "assignment_epoch": int(task.get("assignment_epoch", 0)),
             "playbook": self.selected_playbook,
             "playbook_config_version": self.playbook_config_version,
             "cost": self._claim_cost_to_estimate_locked(east_m, north_m),
@@ -1793,6 +1993,7 @@ class DroneSimulator:
             "assigned_drone_name": None,
             "orbit_radius_m": ORBIT_RADIUS_M,
             "revision": 0,
+            "assignment_epoch": 1 if status == "electing" else 0,
             "event": "Priority evidence accepted; deterministic claim election started.",
             "limitation": RESPONSE_LIMITATION_NOTE,
         }
@@ -1809,6 +2010,82 @@ class DroneSimulator:
             self.outbound_claims.append(claim)
         else:
             self.response_task_queue.append(task_id)
+
+    def _drone_has_active_assignment_locked(self, drone_id: int, excluding_task_id: str | None = None) -> bool:
+        for task_id, task in self.response_tasks.items():
+            if task_id == excluding_task_id:
+                continue
+
+            if task.get("assigned_drone_id") != drone_id:
+                continue
+
+            if task.get("status") in {"transitioning", "orbiting", "assigned_remote"}:
+                return True
+
+        return False
+
+    def _claim_is_current_and_available_locked(self, claim: dict[str, object], task: dict[str, object]) -> bool:
+        if str(claim.get("scenario_run_id")) != str(self.scenario_seed):
+            return False
+
+        if str(claim.get("task_id")) != str(task.get("task_id")):
+            return False
+
+        if str(claim.get("task_state", claim.get("status", "claiming"))) != "claiming":
+            return False
+
+        if int(claim.get("assignment_epoch", task.get("assignment_epoch", 0))) != int(task.get("assignment_epoch", 0)):
+            return False
+
+        if int(claim.get("playbook_config_version", self.playbook_config_version)) != int(task.get("playbook_config_version", self.playbook_config_version)):
+            return False
+
+        claimant_drone_id = int(claim["claimant_drone_id"])
+        return not self._drone_has_active_assignment_locked(claimant_drone_id, str(task["task_id"]))
+
+    def _release_current_assignment_locked(self, task: dict[str, object], owner_task_state: str = "released") -> None:
+        task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
+        task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
+        task["assigned_drone_id"] = None
+        task["assigned_drone_name"] = None
+        task["owner_task_state"] = owner_task_state
+        task["status"] = "reported"
+        task["updated_at"] = self.simulation_time
+
+    def _make_task_allocatable_locked(self, task_id: str, task: dict[str, object]) -> None:
+        if self.selected_playbook != PLAYBOOK_OBSERVE_ORBIT:
+            return
+
+        if str(task.get("signature_id")) in self.cancelled_priority_signatures:
+            return
+
+        if task.get("status") not in {"reported", "released"}:
+            return
+
+        if self.active_response_task_id is None:
+            task["status"] = "electing"
+            task["assignment_epoch"] = int(task.get("assignment_epoch", 0)) + 1
+            task["election_deadline"] = self.simulation_time + TASK_ELECTION_SECONDS
+            task["playbook_config_version"] = self.playbook_config_version
+            task["updated_at"] = self.simulation_time
+            task["owner_task_state"] = None
+            self.active_response_task_id = task_id
+            claim = self._task_claim_payload_locked(task)
+            self.claims.setdefault(task_id, {})[self.drone_id] = claim
+            self.outbound_claims.append(claim)
+        elif task_id not in self.response_task_queue:
+            task["status"] = "queued"
+            task["playbook_config_version"] = self.playbook_config_version
+            task["updated_at"] = self.simulation_time
+            task["owner_task_state"] = None
+            self.response_task_queue.append(task_id)
+
+    def _reconcile_eligible_work_locked(self) -> None:
+        if self.selected_playbook != PLAYBOOK_OBSERVE_ORBIT:
+            return
+
+        for task_id, task in sorted(self.response_tasks.items()):
+            self._make_task_allocatable_locked(task_id, task)
 
     def _record_claim_locked(self, payload: dict[str, object]) -> bool:
         if str(payload.get("scenario_run_id")) != str(self.scenario_seed):
@@ -1846,6 +2123,7 @@ class DroneSimulator:
                 "assigned_drone_name": None,
                 "orbit_radius_m": ORBIT_RADIUS_M,
                 "revision": 0,
+                "assignment_epoch": int(payload.get("assignment_epoch", 0)),
                 "event": "Peer claim received; local deterministic election joined.",
                 "limitation": RESPONSE_LIMITATION_NOTE,
             }
@@ -1862,6 +2140,11 @@ class DroneSimulator:
 
         if payload_status in {"transitioning", "orbiting", "reported", "cancelled", "released"}:
             current_revision = int(task.get("revision", 0))
+            incoming_epoch = int(payload.get("assignment_epoch", task.get("assignment_epoch", 0)))
+            current_epoch = int(task.get("assignment_epoch", 0))
+
+            if incoming_epoch < current_epoch:
+                return False
 
             if revision < current_revision:
                 return False
@@ -1882,7 +2165,34 @@ class DroneSimulator:
 
             owner_drone_id = payload.get("owner_drone_id")
             owner_drone_name = payload.get("owner_drone_name")
+            current_owner_id = task.get("assigned_drone_id")
+            claimant_drone_id = int(payload.get("claimant_drone_id", -1))
+
+            if payload_status in {"released", "reported"} and current_owner_id is not None:
+                try:
+                    current_owner_int = int(current_owner_id)
+                except (TypeError, ValueError):
+                    current_owner_int = -1
+
+                try:
+                    payload_owner_int = int(owner_drone_id) if owner_drone_id is not None else -1
+                except (TypeError, ValueError):
+                    payload_owner_int = -1
+
+                if current_owner_int not in {payload_owner_int, claimant_drone_id}:
+                    return False
+
+            if (
+                payload_status in {"transitioning", "orbiting"}
+                and owner_drone_id is not None
+                and int(owner_drone_id) == self.drone_id
+                and self._drone_has_active_assignment_locked(self.drone_id, task_id)
+            ):
+                self._make_task_allocatable_locked(task_id, task)
+                return False
+
             task["revision"] = revision
+            task["assignment_epoch"] = max(current_epoch, incoming_epoch)
             task["assigned_drone_id"] = owner_drone_id
             task["assigned_drone_name"] = owner_drone_name
             task["object_label"] = str(payload.get("object_label", task.get("object_label", "objective")))
@@ -1907,22 +2217,20 @@ class DroneSimulator:
                     self.active_response_task_id = None
                     self._clear_response_guidance_locked()
             elif payload_status in {"released", "reported"}:
-                task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
-                task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
-                task["assigned_drone_id"] = None
-                task["assigned_drone_name"] = None
-                task["status"] = "reported"
+                self._release_current_assignment_locked(task, payload_status)
 
                 if self.active_response_task_id == task_id:
                     self.active_response_task_id = None
                     self._clear_response_guidance_locked()
+
+                if payload_status == "released":
+                    self._make_task_allocatable_locked(task_id, task)
+                else:
                     self._promote_next_queued_task_locked()
             elif int(owner_drone_id) == self.drone_id:
-                self._demote_other_active_assignments_for_owner_locked(self.drone_id, task_id)
                 self._initialize_local_response_control_locked(task)
                 task["status"] = payload_status
             else:
-                self._demote_other_active_assignments_for_owner_locked(int(owner_drone_id), task_id)
                 task["status"] = "assigned_remote"
 
                 if self.active_response_task_id == task_id:
@@ -1931,6 +2239,9 @@ class DroneSimulator:
                     self._promote_next_queued_task_locked()
 
             return True
+
+        if not self._claim_is_current_and_available_locked(payload, task):
+            return False
 
         self.claims.setdefault(task_id, {})[claimant_drone_id] = dict(payload)
         return True
@@ -1946,26 +2257,14 @@ class DroneSimulator:
             if task.get("status") not in {"transitioning", "orbiting", "assigned_remote"}:
                 continue
 
-            task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
-            task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
-            task["assigned_drone_id"] = None
-            task["assigned_drone_name"] = None
-            task["status"] = "reported"
-            task["owner_task_state"] = "released"
-            task["revision"] = int(task.get("revision", 0)) + 1
-            task["updated_at"] = self.simulation_time
-            task["event"] = "Released locally to preserve one active assignment per drone."
+            task["event"] = "Local invariant check observed another active assignment; no global release was fabricated."
 
-            if self.active_response_task_id == task_id:
-                self.active_response_task_id = None
-                self._clear_response_guidance_locked()
 
-            if task_id in self.response_task_queue:
-                self.response_task_queue.remove(task_id)
-
-    def receive_claim(self, payload: dict[str, object]) -> bool:
+    def receive_claim(self, payload: dict[str, object], payload_byte_count: int = 0) -> bool:
         try:
             with self.lock:
+                self.peer_claim_messages_received += 1
+                self._record_peer_payload_bytes_locked(payload_byte_count, "received")
                 self._advance_locked()
                 return self._record_claim_locked(payload)
         except (KeyError, TypeError, ValueError):
@@ -1987,12 +2286,32 @@ class DroneSimulator:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
+            started_at = time.monotonic()
 
             try:
                 with urllib.request.urlopen(request, timeout=0.4):
                     pass
-            except (OSError, urllib.error.URLError):
+            except (OSError, urllib.error.URLError) as error:
+                with self.lock:
+                    self.peer_send_failures += 1
+                    self.peer_connection_state[peer]["state"] = "error"
+                    self.peer_connection_state[peer]["last_error"] = str(error)
+                    self.peer_connection_state[peer]["latest_error"] = str(error)
+                    self.peer_connection_state[peer]["send_failures"] = int(self.peer_connection_state[peer]["send_failures"]) + 1
                 continue
+
+            elapsed_ms = (time.monotonic() - started_at) * 1000.0
+            with self.lock:
+                self.peer_claim_messages_sent += 1
+                self._record_peer_payload_bytes_locked(len(payload), "sent")
+                self.peer_connection_state[peer]["state"] = "ok"
+                self.peer_connection_state[peer]["last_error"] = None
+                self.peer_connection_state[peer]["latest_error"] = None
+                self.peer_connection_state[peer]["last_success_time"] = self.simulation_time
+                self.peer_connection_state[peer]["last_success_wall_time"] = time.monotonic()
+                self.peer_connection_state[peer]["last_rtt_ms"] = elapsed_ms
+                self.peer_connection_state[peer]["claim_messages_sent"] = int(self.peer_connection_state[peer]["claim_messages_sent"]) + 1
+                self.peer_connection_state[peer]["payload_bytes_sent"] = int(self.peer_connection_state[peer]["payload_bytes_sent"]) + len(payload)
 
     def _resolve_response_tasks_locked(self) -> None:
         task = self.response_tasks.get(self.active_response_task_id or "")
@@ -2000,13 +2319,26 @@ class DroneSimulator:
         if not task or task["status"] != "electing" or self.simulation_time < float(task["election_deadline"]):
             return
 
-        claims = list(self.claims.get(str(task["task_id"]), {}).values())
+        claims = [
+            claim
+            for claim in self.claims.get(str(task["task_id"]), {}).values()
+            if self._claim_is_current_and_available_locked(claim, task)
+        ]
 
-        if not claims:
+        if not claims and not self._drone_has_active_assignment_locked(self.drone_id, str(task["task_id"])):
             claim = self._task_claim_payload_locked(task)
             self.claims.setdefault(str(task["task_id"]), {})[self.drone_id] = claim
             self.outbound_claims.append(claim)
             claims = [claim]
+
+        if not claims:
+            task["status"] = "queued"
+            task["updated_at"] = self.simulation_time
+            if str(task["task_id"]) not in self.response_task_queue:
+                self.response_task_queue.append(str(task["task_id"]))
+            self.active_response_task_id = None
+            self._promote_next_queued_task_locked()
+            return
 
         winning_claim = sorted(
             claims,
@@ -2018,9 +2350,19 @@ class DroneSimulator:
             ),
         )[0]
         assigned_drone_id = int(winning_claim["claimant_drone_id"])
-        self._demote_other_active_assignments_for_owner_locked(assigned_drone_id, str(task["task_id"]))
+        if self._drone_has_active_assignment_locked(assigned_drone_id, str(task["task_id"])):
+            self.claims.get(str(task["task_id"]), {}).pop(assigned_drone_id, None)
+            task["status"] = "queued"
+            task["updated_at"] = self.simulation_time
+            if str(task["task_id"]) not in self.response_task_queue:
+                self.response_task_queue.append(str(task["task_id"]))
+            self.active_response_task_id = None
+            self._promote_next_queued_task_locked()
+            return
+
         task["assigned_drone_id"] = assigned_drone_id
         task["assigned_drone_name"] = str(winning_claim["claimant_drone_name"])
+        task["assignment_epoch"] = int(task.get("assignment_epoch", 0))
         task["updated_at"] = self.simulation_time
 
         if self.selected_playbook == PLAYBOOK_REPORT_CONTINUE:
@@ -2063,6 +2405,7 @@ class DroneSimulator:
         self.response_task_queue.remove(next_task_id)
         task = self.response_tasks[next_task_id]
         task["status"] = "electing"
+        task["assignment_epoch"] = int(task.get("assignment_epoch", 0)) + 1
         task["election_deadline"] = self.simulation_time + TASK_ELECTION_SECONDS
         task["updated_at"] = self.simulation_time
         self.active_response_task_id = next_task_id
@@ -2210,22 +2553,31 @@ class DroneRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(self.simulator.control_payload())
             return
 
+        if self.path == "/network":
+            self._send_json(self.simulator.network_payload())
+            return
+
+        if self.path.startswith("/trace?"):
+            observation_id = self.path.split("observation_id=", 1)[-1].split("&", 1)[0]
+            self._send_json(self.simulator.trace_observation_payload(observation_id))
+            return
+
         self.send_error(404)
 
     def do_POST(self) -> None:
         try:
-            payload = self._read_json_payload()
+            payload, payload_byte_count = self._read_json_payload()
         except json.JSONDecodeError:
             self.send_error(400, "Invalid JSON")
             return
 
         if self.path == "/observations":
-            accepted = self.simulator.receive_observation(payload)
+            accepted = self.simulator.receive_observation(payload, payload_byte_count)
             self._send_json({"accepted": accepted})
             return
 
         if self.path == "/claims":
-            accepted = self.simulator.receive_claim(payload)
+            accepted = self.simulator.receive_claim(payload, payload_byte_count)
             self._send_json({"accepted": accepted})
             return
 
@@ -2280,10 +2632,10 @@ class DroneRequestHandler(http.server.BaseHTTPRequestHandler):
 
         self.send_error(404)
 
-    def _read_json_payload(self) -> dict[str, object]:
+    def _read_json_payload(self) -> tuple[dict[str, object], int]:
         content_length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(content_length)
-        return json.loads(body.decode("utf-8") or "{}")
+        return json.loads(body.decode("utf-8") or "{}"), len(body)
 
     def _send_json(self, payload: dict[str, object]) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -2331,6 +2683,8 @@ def main() -> int:
         args.seed,
         args.priority_count,
         args.playbook,
+        args.host,
+        args.port,
     )
 
     stop_event = threading.Event()

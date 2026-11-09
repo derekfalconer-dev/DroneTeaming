@@ -83,7 +83,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     .truth-canvas {
-      height: auto;
+      height: clamp(420px, 65vh, 760px);
     }
 
     details {
@@ -168,7 +168,18 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     .map-card.belief {
+      border-color: var(--drone-color, #334155);
+      border-width: 3px;
       min-width: 0;
+    }
+
+    .map-card.belief .map-title {
+      justify-content: flex-start;
+      gap: 0.5rem;
+    }
+
+    .map-card.belief .map-title .pill {
+      margin-left: auto;
     }
 
     .diagnostics-grid {
@@ -318,16 +329,131 @@ DASHBOARD_HTML = r"""<!doctype html>
       vertical-align: middle;
       width: 0.75rem;
     }
+
+    .sensor-label {
+      background: #7c2d12;
+      border: 1px solid #fb923c;
+      border-radius: 8px;
+      color: #fed7aa;
+      display: inline-block;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      margin-bottom: 0.5rem;
+      padding: 0.35rem 0.5rem;
+    }
+
+    .trace-table,
+    .network-table {
+      border-collapse: collapse;
+      font-size: 0.82rem;
+      margin-top: 0.5rem;
+      width: 100%;
+    }
+
+    .trace-table th,
+    .trace-table td,
+    .network-table th,
+    .network-table td {
+      border-bottom: 1px solid #334155;
+      padding: 0.35rem;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    pre.raw-json {
+      background: #020617;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      overflow: auto;
+      padding: 0.5rem;
+      white-space: pre-wrap;
+    }
+
+    .tabs {
+      align-items: flex-end;
+      border-bottom: 1px solid #334155;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.25rem;
+      margin: 1rem 0 0;
+    }
+
+    .tab-button {
+      background: transparent;
+      border: 0;
+      border-bottom: 3px solid transparent;
+      border-radius: 8px 8px 0 0;
+      color: #94a3b8;
+      padding: 0.75rem 1rem;
+    }
+
+    .tab-button:hover,
+    .tab-button:focus-visible {
+      background: #0f172a;
+      color: #e2e8f0;
+      outline: 2px solid #60a5fa;
+      outline-offset: -2px;
+    }
+
+    .tab-button[aria-selected="true"] {
+      background: #1e293b;
+      border-bottom-color: #60a5fa;
+      color: #f8fafc;
+    }
+
+    .tab-panel {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-top: 0;
+      display: none;
+      padding: 1rem 0 0;
+    }
+
+    .tab-panel.active {
+      display: block;
+    }
+
+    .shared-inspector {
+      margin-top: 1rem;
+    }
+
+    .json-toolbar {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin: 0.5rem 0;
+    }
+
+    .json-area {
+      background: #020617;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #e2e8f0;
+      display: block;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      height: 320px;
+      overflow: auto;
+      padding: 0.5rem;
+      resize: vertical;
+      white-space: pre;
+      width: 100%;
+    }
+
+    .inspection-note {
+      color: #fbbf24;
+      font-size: 0.85rem;
+      margin: 0.5rem 0;
+    }
   </style>
 </head>
 <body>
   <h1>Drone Simulation Dashboard</h1>
+  <p><strong>Three independent drone programs. Simulated sensors. Real peer network messages. Each drone maintains its own map.</strong></p>
   <p>Three independent moving drones maintain node-local belief maps, sense only within their moving camera footprints, and exchange original observations over peer TCP transport.</p>
 
-  <section class="controls">
+  <section class="controls" id="shared-controls">
     <button id="pause-button" type="button">Pause</button>
-    <button id="reset-button" type="button">Restart scenario</button>
-    <button id="new-scenario-button" type="button">New random scenario</button>
     <button id="sharing-button" type="button">Enable sharing</button>
     <button id="cancel-response-button" type="button">Cancel response</button>
     <label class="pill">Playbook
@@ -343,7 +469,26 @@ DASHBOARD_HTML = r"""<!doctype html>
     <span id="scenario-state" class="pill">Scenario loading…</span>
   </section>
 
-  <section class="card">
+  <nav class="tabs" role="tablist" aria-label="Dashboard sections">
+    <button id="tab-button-team" class="tab-button" role="tab" type="button" data-tab="team" aria-selected="true" aria-controls="tab-team" tabindex="0">Team picture</button>
+    <button id="tab-button-truth" class="tab-button" role="tab" type="button" data-tab="truth" aria-selected="false" aria-controls="tab-truth" tabindex="-1">Simulation truth</button>
+    <button id="tab-button-network" class="tab-button" role="tab" type="button" data-tab="network" aria-selected="false" aria-controls="tab-network" tabindex="-1">Network &amp; messages</button>
+  </nav>
+
+  <section id="tab-team" class="tab-panel active" role="tabpanel" aria-labelledby="tab-button-team"></section>
+  <section id="tab-truth" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-truth"></section>
+  <section id="tab-network" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-network"></section>
+
+  <section class="card" id="network-card">
+    <div class="map-title"><span>Team network</span><span id="network-summary" class="pill">network diagnostics loading…</span></div>
+    <details>
+      <summary>Peer HTTP diagnostics</summary>
+      <div class="control-note">Peer counters are instrumented in the drone processes' real HTTP send/receive paths. Bandwidth is JSON payload only and excludes dashboard polling.</div>
+      <div id="network-details" class="details"></div>
+    </details>
+  </section>
+
+  <section class="card" id="belief-display-card">
     <div class="map-title"><span>Belief display controls</span><span class="pill">display only</span></div>
     <label class="pill"><input id="measurement-toggle" type="checkbox" checked> Sensor measurements</label>
     <label class="pill"><input id="ellipse-toggle" type="checkbox" checked> Uncertainty ellipses</label>
@@ -352,14 +497,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     <span class="control-note">These filters affect only dashboard rendering; they do not change sensing, fusion, or allocation.</span>
   </section>
 
-  <section class="card">
+  <section class="card" id="assignment-card">
     <div class="map-title"><span>Priority response assignments</span><span class="pill">connected-peer claim state</span></div>
     <div id="assignment-details" class="details"></div>
   </section>
 
-  <section class="map-grid">
-    <article class="map-card belief">
-      <div class="map-title"><span>Red belief</span><span class="pill">actual local map</span></div>
+  <section class="map-grid" id="map-grid-section">
+    <article class="map-card belief" style="--drone-color: #ef4444;">
+      <div class="map-title"><span><span class="swatch" style="background: #ef4444"></span>Red belief</span><span class="pill">actual local map</span></div>
       <canvas id="belief-map-1" class="belief-canvas" width="780" height="420"></canvas>
       <div id="belief-details-1" class="details"></div>
       <details>
@@ -368,8 +513,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       </details>
     </article>
 
-    <article class="map-card belief">
-      <div class="map-title"><span>Blue belief</span><span class="pill">actual local map</span></div>
+    <article class="map-card belief" style="--drone-color: #3b82f6;">
+      <div class="map-title"><span><span class="swatch" style="background: #3b82f6"></span>Blue belief</span><span class="pill">actual local map</span></div>
       <canvas id="belief-map-2" class="belief-canvas" width="780" height="420"></canvas>
       <div id="belief-details-2" class="details"></div>
       <details>
@@ -378,8 +523,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       </details>
     </article>
 
-    <article class="map-card belief">
-      <div class="map-title"><span>Green belief</span><span class="pill">actual local map</span></div>
+    <article class="map-card belief" style="--drone-color: #22c55e;">
+      <div class="map-title"><span><span class="swatch" style="background: #22c55e"></span>Green belief</span><span class="pill">actual local map</span></div>
       <canvas id="belief-map-3" class="belief-canvas" width="780" height="420"></canvas>
       <div id="belief-details-3" class="details"></div>
       <details>
@@ -388,7 +533,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       </details>
     </article>
 
-    <article class="map-card truth">
+    <article class="map-card truth" id="truth-card">
       <div class="map-title">
         <span>Simulation truth</span>
         <span class="pill">persistent objects</span>
@@ -399,8 +544,10 @@ DASHBOARD_HTML = r"""<!doctype html>
         <label class="pill"><input id="truth-label-toggle" type="checkbox" checked> Truth-object labels</label>
         <label class="pill"><input id="background-truth-toggle" type="checkbox" checked> Background truth objects</label>
       </div>
-      <div class="control-panel">
+      <div class="control-panel" id="scenario-control-panel">
         <h3>Scenario configuration</h3>
+        <button id="reset-button" type="button">Restart scenario</button>
+        <button id="new-scenario-button" type="button">New random scenario</button>
         <label class="pill">Priority object count
           <select id="priority-count-select">
             <option value="0" selected>Random (1–5)</option>
@@ -419,6 +566,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     </article>
   </section>
 
+  <section class="card shared-inspector" id="shared-inspector-card">
+    <div class="map-title"><span>Object inspector</span><span class="pill">live object · pinned sensor report</span></div>
+    <div id="shared-inspector" class="details">
+      <div class="empty-state">Select an object on a drone belief map to inspect its contributing sensor reports.</div>
+    </div>
+  </section>
+
   <h2>Flight telemetry</h2>
   <main id="drone-grid" class="grid"></main>
 
@@ -428,6 +582,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     const state = {
       statuses: new Map(),
       beliefs: new Map(),
+      networks: new Map(),
       truth: { objects: [], simulation_time: 0 },
       sharingEnabled: false,
       paused: false,
@@ -458,6 +613,19 @@ DASHBOARD_HTML = r"""<!doctype html>
       mapHitTargets: new Map(),
       hoveredMapObject: null,
       selectedMapObject: null,
+      selectedObservation: null,
+      selectedObservationKey: null,
+      selectedObservationSnapshot: null,
+      observationSelectionMode: "latest",
+      observationTrace: new Map(),
+      rawJsonOpen: false,
+      rawJsonScrollTop: 0,
+      rawJsonSelectionStart: 0,
+      rawJsonSelectionEnd: 0,
+      rawJsonHadFocus: false,
+      selectionMessage: "",
+      activeTab: "team",
+      playbookSelectDirty: false,
     };
 
     function createCard(drone) {
@@ -504,13 +672,15 @@ DASHBOARD_HTML = r"""<!doctype html>
       const card = document.getElementById(`drone-${drone.id}`);
 
       try {
-        const [status, belief] = await Promise.all([
+        const [status, belief, network] = await Promise.all([
           fetchJson(`${drone.url}/status`),
           fetchJson(`${drone.url}/objects`),
+          fetchJson(`${drone.url}/network`),
         ]);
 
         state.statuses.set(drone.id, status);
         state.beliefs.set(drone.id, belief);
+        state.networks.set(drone.id, network);
         state.sharingEnabled = Boolean(status.sharing_enabled);
         state.paused = Boolean(status.paused);
         state.selectedPlaybook = status.selected_playbook || state.selectedPlaybook;
@@ -557,6 +727,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         }
 
         state.statuses.delete(drone.id);
+        state.networks.delete(drone.id);
         state.droneAvailability.set(drone.id, {
           online: false,
           receivedAt: Date.now() / 1000,
@@ -584,6 +755,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
       if (state.currentRunKey && state.currentRunKey !== runKey) {
         state.taskSnapshotsByDrone.clear();
+        clearInspectionSelection("Scenario changed. Previous selected object and pinned sensor report were cleared.");
       }
 
       state.currentRunKey = runKey;
@@ -643,13 +815,219 @@ DASHBOARD_HTML = r"""<!doctype html>
       state.mapHitTargets.get(canvas.id).push(target);
     }
 
+    function uncertaintyDimensions(covariance) {
+      if (!covariance) {
+        return "—";
+      }
+
+      const params = ellipseParams(covariance);
+      return `${(params.majorM * 2).toFixed(1)} m × ${(params.minorM * 2).toFixed(1)} m`;
+    }
+
+    function observationKey(observation) {
+      return `${observation.scenario_run_id || "unknown-run"}:${observation.observation_id}`;
+    }
+
+    function snapshotObservation(observation, target) {
+      return {
+        targetKey: target.key,
+        droneId: target.droneId,
+        droneName: droneNameForId(target.droneId),
+        observationKey: observationKey(observation),
+        observation: JSON.parse(JSON.stringify(observation)),
+        rawJson: JSON.stringify(observation.raw_observation || observation, null, 2),
+        savedAt: new Date().toISOString(),
+      };
+    }
+
+    function currentObservationForTarget(target) {
+      if (!target || !target.object || !target.object.measurements || target.object.measurements.length === 0) {
+        return null;
+      }
+
+      if (state.observationSelectionMode === "pinned" && state.selectedObservationKey) {
+        return target.object.measurements.find((item) => observationKey(item) === state.selectedObservationKey) || null;
+      }
+
+      return target.object.measurements
+        .slice()
+        .sort((left, right) => Number(right.timestamp || 0) - Number(left.timestamp || 0))[0];
+    }
+
+    function snapshotJsonUiState() {
+      const jsonDetails = document.getElementById("observation-json-details");
+      const jsonArea = document.getElementById("observation-json-area");
+
+      if (jsonDetails) {
+        state.rawJsonOpen = Boolean(jsonDetails.open);
+      }
+
+      if (jsonArea) {
+        state.rawJsonScrollTop = jsonArea.scrollTop;
+        state.rawJsonSelectionStart = Number(jsonArea.selectionStart || 0);
+        state.rawJsonSelectionEnd = Number(jsonArea.selectionEnd || 0);
+        state.rawJsonHadFocus = document.activeElement === jsonArea;
+      }
+    }
+
+    function restoreJsonUiState() {
+      const jsonArea = document.getElementById("observation-json-area");
+
+      if (!jsonArea) {
+        return;
+      }
+
+      jsonArea.scrollTop = state.rawJsonScrollTop;
+
+      if (state.rawJsonHadFocus) {
+        jsonArea.focus();
+
+        if (typeof jsonArea.setSelectionRange === "function") {
+          jsonArea.setSelectionRange(state.rawJsonSelectionStart, state.rawJsonSelectionEnd);
+        }
+      }
+    }
+
+    function selectedObservationSnapshotFor(target) {
+      const liveObservation = currentObservationForTarget(target);
+
+      if (state.observationSelectionMode === "latest" && liveObservation) {
+        state.selectedObservationKey = observationKey(liveObservation);
+        state.selectedObservationSnapshot = snapshotObservation(liveObservation, target);
+        return {
+          snapshot: state.selectedObservationSnapshot,
+          liveAvailable: true,
+          pinned: false,
+        };
+      }
+
+      if (state.selectedObservationSnapshot) {
+        return {
+          snapshot: state.selectedObservationSnapshot,
+          liveAvailable: Boolean(liveObservation),
+          pinned: true,
+        };
+      }
+
+      if (liveObservation) {
+        state.selectedObservationKey = observationKey(liveObservation);
+        state.selectedObservationSnapshot = snapshotObservation(liveObservation, target);
+        return {
+          snapshot: state.selectedObservationSnapshot,
+          liveAvailable: true,
+          pinned: false,
+        };
+      }
+
+      return null;
+    }
+
+    function observationInspectorHtml(target) {
+      if (!target || !target.object || !target.object.measurements || target.object.measurements.length === 0) {
+        return '<div class="empty-state">No contributing sensor reports are available for this object.</div>';
+      }
+
+      const selected = selectedObservationSnapshotFor(target);
+      if (!selected) {
+        return '<div class="empty-state">No sensor report selected.</div>';
+      }
+
+      const observation = selected.snapshot.observation;
+      const traceRows = state.observationTrace.get(observation.observation_id) || [];
+      const snapshotLabel = selected.pinned
+        ? selected.liveAvailable
+          ? "Pinned simulated sensor report — exact JSON held stable while live object updates."
+          : "Saved inspection snapshot — this exact observation is no longer present in the current node object record."
+        : "Latest observation — select a report below to pin its exact JSON.";
+
+      return `
+        <div class="control-panel">
+          <span class="sensor-label">SIMULATED SENSOR INPUT</span>
+          <div class="inspection-note">${escapeHtml(snapshotLabel)}</div>
+          <h3>Contributing observations</h3>
+          <div class="json-toolbar">
+            <button type="button" data-observation-mode="latest" data-target-key="${escapeHtml(target.key)}">Latest observation</button>
+            ${target.object.measurements.map((item) => `
+              <button type="button" data-observation-id="${escapeHtml(item.observation_id)}" data-observation-run-id="${escapeHtml(item.scenario_run_id || "unknown-run")}" data-target-key="${escapeHtml(target.key)}">
+                ${escapeHtml(item.source_drone_name)} · ${escapeHtml(item.sensor_id)} · ${escapeHtml(item.source_track_id)}
+              </button>
+            `).join(" ")}
+          </div>
+          <dl class="diagnostics-grid">
+            <dt>Original drone</dt><dd>${escapeHtml(observation.source_drone_name)} (#${escapeHtml(observation.source_drone_id)})</dd>
+            <dt>Sensor</dt><dd>${escapeHtml(observation.sensor_id)}</dd>
+            <dt>Source-local track ID</dt><dd>${escapeHtml(observation.source_track_id)}</dd>
+            <dt>Observation ID</dt><dd>${escapeHtml(observation.observation_id)}</dd>
+            <dt>Run ID</dt><dd>${escapeHtml(observation.scenario_run_id || "—")}</dd>
+            <dt>Capture timestamp</dt><dd>${Number(observation.timestamp || 0).toFixed(1)} s mission time</dd>
+            <dt>Object class</dt><dd>${escapeHtml(target.object.label || "—")}</dd>
+            <dt>Classification score</dt><dd>${Number(observation.classification_score || 0).toFixed(2)}</dd>
+            <dt>Measured position</dt><dd>${Number(observation.east_m || 0).toFixed(1)} m E, ${Number(observation.north_m || 0).toFixed(1)} m N</dd>
+            <dt>Covariance</dt><dd>${escapeHtml(JSON.stringify(observation.covariance || []))}</dd>
+            <dt>95% horizontal uncertainty</dt><dd>${escapeHtml(uncertaintyDimensions(observation.covariance))}</dd>
+          </dl>
+          <button type="button" data-trace-observation-id="${escapeHtml(observation.observation_id)}">Trace this observation</button>
+          ${traceRows.length ? `
+            <table class="trace-table">
+              <thead><tr><th>Node</th><th>Trace status</th><th>Associated local map object</th><th>Retention</th></tr></thead>
+              <tbody>
+                ${traceRows.map((row) => `
+                  <tr>
+                    <td>${escapeHtml(row.drone_name)} (#${escapeHtml(row.drone_id)})</td>
+                    <td>${row.record
+                      ? `${row.record.originated_locally ? "Originated locally · " : "Received · "}${escapeHtml(row.record.outcome)}`
+                      : "Not seen / trace record no longer retained"}</td>
+                    <td>${row.record ? escapeHtml(row.record.associated_local_object_id || "—") : "—"}</td>
+                    <td>${escapeHtml(row.retained_trace_count)} retained · ${escapeHtml(row.trace_evictions)} evicted</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          ` : ""}
+          <details id="observation-json-details"${state.rawJsonOpen ? " open" : ""}>
+            <summary>Raw JSON</summary>
+            <div class="json-toolbar">
+              <button type="button" data-copy-observation-json="true">Copy JSON</button>
+              <span class="control-note">Bounded inspector view; live fused-object age can change while this pinned report remains unchanged.</span>
+            </div>
+            <textarea id="observation-json-area" class="json-area" readonly>${escapeHtml(selected.snapshot.rawJson)}</textarea>
+          </details>
+        </div>
+      `;
+    }
+
+    function droneNameForId(droneId) {
+      const drone = drones.find((item) => item.id === droneId);
+      return drone ? drone.name : "Unknown drone";
+    }
+
+    function sourceIdentityList(measurements) {
+      const identities = new Set();
+
+      for (const measurement of measurements || []) {
+        identities.add(`${measurement.source_drone_name || "Unknown drone"} / ${measurement.sensor_id || "unknown sensor"}`);
+      }
+
+      return [...identities].sort();
+    }
+
     function objectDetailHtml(target) {
       if (!target) {
         return "";
       }
 
       const object = target.object;
-      const sources = object.source_names && object.source_names.length ? object.source_names.join(", ") : "—";
+      const historicalSources = object.historical_source_names && object.historical_source_names.length
+        ? object.historical_source_names
+        : object.source_names || [];
+      const observedBy = historicalSources.length
+        ? historicalSources.join(", ")
+        : sourceIdentityList(object.measurements).join(", ") || "Provenance unavailable";
+      const recentSources = object.source_names && object.source_names.length
+        ? object.source_names.join(", ")
+        : object.stale
+          ? "None — stale"
+          : "None currently usable";
       const age = target.ageSeconds === null || target.ageSeconds === undefined ? "—" : `${target.ageSeconds.toFixed(1)} s`;
       const priority = object.priority ? "yes" : "no";
 
@@ -659,16 +1037,34 @@ DASHBOARD_HTML = r"""<!doctype html>
           <dl class="diagnostics-grid">
             <dt>Class</dt><dd>${escapeHtml(priorityClassLabel(object))}</dd>
             <dt>Priority</dt><dd>${priority}</dd>
-            <dt>Observing sources</dt><dd>${escapeHtml(sources)}</dd>
+            <dt>Observed by</dt><dd>${escapeHtml(observedBy)}</dd>
+            <dt>Recent sources</dt><dd>${escapeHtml(recentSources)}</dd>
             <dt>Age</dt><dd>${escapeHtml(age)}</dd>
           </dl>
         </div>
+        ${observationInspectorHtml(target)}
       `;
     }
 
+    function latestTargetFor(target) {
+      if (!target || !target.key) {
+        return target;
+      }
+
+      for (const targets of state.mapHitTargets.values()) {
+        const current = targets.find((candidate) => candidate.key === target.key);
+
+        if (current) {
+          return current;
+        }
+      }
+
+      return target;
+    }
+
     function activeMapDetailFor(kind, droneId = null) {
-      const selected = state.selectedMapObject;
-      const hovered = state.hoveredMapObject;
+      const selected = latestTargetFor(state.selectedMapObject);
+      const hovered = latestTargetFor(state.hoveredMapObject);
       const matches = (target) => target
         && target.kind === kind
         && (droneId === null || target.droneId === droneId);
@@ -706,24 +1102,34 @@ DASHBOARD_HTML = r"""<!doctype html>
       for (const drone of drones) {
         renderBeliefDetails(drone);
       }
+
+      renderSharedInspector();
     }
 
     function resizeCanvasBackingStore(canvas) {
       const rect = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : null;
-      const cssWidth = rect && rect.width ? rect.width : canvas.width;
-      const cssHeight = rect && rect.height ? rect.height : canvas.height;
+
+      if (!rect || rect.width <= 0 || rect.height <= 0) {
+        return false;
+      }
+
       const pixelRatio = window.devicePixelRatio || 1;
-      const backingWidth = Math.max(1, Math.round(cssWidth * pixelRatio));
-      const backingHeight = Math.max(1, Math.round(cssHeight * pixelRatio));
+      const backingWidth = Math.max(1, Math.round(rect.width * pixelRatio));
+      const backingHeight = Math.max(1, Math.round(rect.height * pixelRatio));
 
       if (canvas.width !== backingWidth || canvas.height !== backingHeight) {
         canvas.width = backingWidth;
         canvas.height = backingHeight;
       }
+
+      return true;
     }
 
     function drawBaseMap(canvas, bounds) {
-      resizeCanvasBackingStore(canvas);
+      if (!resizeCanvasBackingStore(canvas)) {
+        return false;
+      }
+
       state.mapHitTargets.set(canvas.id, []);
       const ctx = canvas.getContext("2d");
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -743,6 +1149,8 @@ DASHBOARD_HTML = r"""<!doctype html>
         ctx.lineTo(canvas.width, y);
         ctx.stroke();
       }
+
+      return true;
     }
 
     function drawFlightTrails(canvas, bounds) {
@@ -776,46 +1184,66 @@ DASHBOARD_HTML = r"""<!doctype html>
       }
     }
 
-    function drawFootprintsAndDrones(canvas, bounds) {
+    function drawDroneMarker(ctx, canvas, bounds, drone, status, alpha) {
+      const position = project(status, bounds, canvas);
+      const heading = (status.heading_deg - 90) * (Math.PI / 180);
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(position.x, position.y);
+      ctx.rotate(heading);
+      ctx.fillStyle = drone.color;
+      ctx.beginPath();
+      ctx.moveTo(13, 0);
+      ctx.lineTo(-9, -7);
+      ctx.lineTo(-6, 0);
+      ctx.lineTo(-9, 7);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = "#e2e8f0";
+      ctx.font = "12px sans-serif";
+      ctx.fillText(drone.name, position.x + 10, position.y - 10);
+      ctx.restore();
+    }
+
+    function drawFootprintsAndDrones(canvas, bounds, emphasizedDroneId = null) {
       const ctx = canvas.getContext("2d");
+      const activeDrones = drones
+        .map((drone) => ({ drone, status: state.statuses.get(drone.id) }))
+        .filter((item) => item.status);
+      const orderedDrones = emphasizedDroneId === null
+        ? activeDrones
+        : [
+          ...activeDrones.filter((item) => item.drone.id !== emphasizedDroneId),
+          ...activeDrones.filter((item) => item.drone.id === emphasizedDroneId),
+        ];
 
-      for (const drone of drones) {
-        const status = state.statuses.get(drone.id);
-
-        if (!status) {
-          continue;
-        }
-
+      for (const { drone, status } of activeDrones) {
+        const isEmphasized = emphasizedDroneId === null || drone.id === emphasizedDroneId;
         const footprint = status.camera_footprint.map((point) => project(point, bounds, canvas));
+
+        ctx.save();
+        ctx.globalAlpha = emphasizedDroneId === null || isEmphasized ? 1 : 0.25;
         ctx.beginPath();
         ctx.moveTo(footprint[0].x, footprint[0].y);
         ctx.lineTo(footprint[1].x, footprint[1].y);
         ctx.lineTo(footprint[2].x, footprint[2].y);
         ctx.closePath();
-        ctx.fillStyle = `${drone.color}26`;
-        ctx.strokeStyle = `${drone.color}bb`;
-        ctx.lineWidth = 2;
+        ctx.fillStyle = isEmphasized ? `${drone.color}33` : `${drone.color}26`;
+        ctx.strokeStyle = isEmphasized ? drone.color : `${drone.color}bb`;
+        ctx.lineWidth = isEmphasized ? 3 : 2;
         ctx.fill();
         ctx.stroke();
-
-        const position = project(status, bounds, canvas);
-        const heading = (status.heading_deg - 90) * (Math.PI / 180);
-        ctx.save();
-        ctx.translate(position.x, position.y);
-        ctx.rotate(heading);
-        ctx.fillStyle = drone.color;
-        ctx.beginPath();
-        ctx.moveTo(13, 0);
-        ctx.lineTo(-9, -7);
-        ctx.lineTo(-6, 0);
-        ctx.lineTo(-9, 7);
-        ctx.closePath();
-        ctx.fill();
         ctx.restore();
+      }
 
-        ctx.fillStyle = "#e2e8f0";
-        ctx.font = "12px sans-serif";
-        ctx.fillText(drone.name, position.x + 10, position.y - 10);
+      for (const { drone, status } of orderedDrones) {
+        const alpha = emphasizedDroneId === null || drone.id === emphasizedDroneId ? 1 : 0.4;
+        drawDroneMarker(ctx, canvas, bounds, drone, status, alpha);
       }
     }
 
@@ -850,6 +1278,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         }
 
         registerMapTarget(canvas, {
+          key: `truth:${object.id || object.object_id || position.x}:${position.y}`,
           kind: "truth",
           object,
           x: position.x,
@@ -1019,6 +1448,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
         const age = Math.max(0, Number(belief.simulation_time || 0) - Number(object.last_seen || 0));
         registerMapTarget(canvas, {
+          key: `belief:${droneId}:${object.local_object_id || object.object_id}`,
           kind: "belief",
           droneId,
           object,
@@ -1052,6 +1482,28 @@ DASHBOARD_HTML = r"""<!doctype html>
       `;
     }
 
+    function renderSharedInspector() {
+      snapshotJsonUiState();
+
+      const inspector = document.getElementById("shared-inspector");
+      const activeDetail = activeMapDetailFor("belief");
+
+      if (!activeDetail) {
+        inspector.innerHTML = state.selectionMessage
+          ? `<div class="inspection-note">${escapeHtml(state.selectionMessage)}</div><div class="empty-state">Select an object on a drone belief map to inspect its contributing sensor reports.</div>`
+          : '<div class="empty-state">Select an object on a drone belief map to inspect its contributing sensor reports.</div>';
+        return;
+      }
+
+      inspector.innerHTML = `
+        <div class="control-panel">
+          <h3>${escapeHtml(droneNameForId(activeDetail.droneId))} belief object</h3>
+          ${objectDetailHtml(activeDetail)}
+        </div>
+      `;
+      restoreJsonUiState();
+    }
+
     function renderBeliefDetails(drone) {
       const details = document.getElementById(`belief-details-${drone.id}`);
       const belief = state.beliefs.get(drone.id);
@@ -1081,7 +1533,6 @@ DASHBOARD_HTML = r"""<!doctype html>
 
       details.innerHTML = `
         ${counts}
-        ${objectDetailHtml(activeDetail)}
         <details class="detected-objects"${state.beliefObjectTablesOpen.get(drone.id) ? " open" : ""}>
           <summary>Detected objects (${visibleObjects.length})</summary>
           <table class="object-table">
@@ -1089,7 +1540,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             <tr>
               <th>Local object ID</th>
               <th>Class</th>
-              <th>Observing sources</th>
+              <th>Recent sources</th>
               <th>Type</th>
               <th>Freshness</th>
             </tr>
@@ -1160,20 +1611,24 @@ DASHBOARD_HTML = r"""<!doctype html>
 
       const bounds = boundsFor(points);
       const truthCanvas = document.getElementById("truth-map");
-      drawBaseMap(truthCanvas, bounds);
-      drawFlightTrails(truthCanvas, bounds);
-      drawFootprintsAndDrones(truthCanvas, bounds);
-      drawTruth(truthCanvas, bounds);
+      if (drawBaseMap(truthCanvas, bounds)) {
+        drawFlightTrails(truthCanvas, bounds);
+        drawFootprintsAndDrones(truthCanvas, bounds);
+        drawTruth(truthCanvas, bounds);
+      }
       renderTruthDetails();
 
       for (const drone of drones) {
         const canvas = document.getElementById(`belief-map-${drone.id}`);
-        drawBaseMap(canvas, bounds);
-        drawFootprintsAndDrones(canvas, bounds);
-        drawBeliefObjects(canvas, bounds, drone.id);
+        if (drawBaseMap(canvas, bounds)) {
+          drawFootprintsAndDrones(canvas, bounds, drone.id);
+          drawBeliefObjects(canvas, bounds, drone.id);
+        }
         renderBeliefDetails(drone);
         renderDiagnostics(drone);
       }
+
+      renderSharedInspector();
     }
 
     const STATUS_REPORT_STALE_SECONDS = 3.5;
@@ -1412,15 +1867,15 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     function compareAssignmentReports(left, right) {
       const leftKey = [
-        assignmentRevision(left.task),
         assignmentEpoch(left.task),
         reportAuthority(left),
+        assignmentRevision(left.task),
         taskUpdateTime(left.task),
       ];
       const rightKey = [
-        assignmentRevision(right.task),
         assignmentEpoch(right.task),
         reportAuthority(right),
+        assignmentRevision(right.task),
         taskUpdateTime(right.task),
       ];
 
@@ -1490,6 +1945,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             : reports.find((report) => report.snapshot.droneId === assignedDroneId);
           const freshOwnerReport = ownerReport && isFreshSnapshot(ownerReport.snapshot) ? ownerReport : null;
           const freshOwnerActiveReport = freshOwnerReport && reportMatchesOwnerActiveTask(freshOwnerReport) ? freshOwnerReport : null;
+          const freshOwnerInactiveReport = freshOwnerReport && !freshOwnerActiveReport ? freshOwnerReport : null;
           const peerReport = assignedDroneId === null
             ? null
             : reports
@@ -1510,9 +1966,10 @@ DASHBOARD_HTML = r"""<!doctype html>
               || normalizedExecutionState(freshOwnerActiveReport.task.status)
               || "Assigned — activity unknown";
             sourceLabel = `owner ${snapshotTaskReportAge(freshOwnerActiveReport.snapshot)}`;
-          } else if (freshOwnerReport) {
-            selectedReport = freshOwnerReport;
-            sourceLabel = `owner ${snapshotTaskReportAge(freshOwnerReport.snapshot)} · not active on owner`;
+          } else if (freshOwnerInactiveReport) {
+            selectedReport = freshOwnerInactiveReport;
+            taskState = "reported";
+            sourceLabel = `owner ${snapshotTaskReportAge(freshOwnerInactiveReport.snapshot)} · not active on owner · historical owner not displayed as current`;
           } else if (peerReport) {
             selectedReport = peerReport;
             taskState = `${peerReportedExecutionState(peerReport.task)} (peer-reported)`;
@@ -1530,7 +1987,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             signatureId: assignedReport.task.signature_id || taskId,
             displayName: taskDisplayName(assignedReport.task, reports),
             debugTitle: taskDebugTitle(assignedReport.task),
-            assignedDroneName: assignedDroneId === null ? "Unassigned" : assignedDroneNameFor(assignedReport.task),
+            assignedDroneName: (assignedDroneId === null || freshOwnerInactiveReport) ? "Unassigned" : assignedDroneNameFor(assignedReport.task),
             taskState,
             observationAge: observationAgeFor(selectedReport.task, selectedReport.snapshot),
             sourceLabel,
@@ -1565,6 +2022,181 @@ DASHBOARD_HTML = r"""<!doctype html>
       }
 
       return summary;
+    }
+
+    function afterLayout(callback) {
+      if (typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(() => window.requestAnimationFrame(callback));
+      } else {
+        setTimeout(callback, 0);
+      }
+    }
+
+    function arrangeDashboardTabs() {
+      document.getElementById("tab-team").appendChild(document.getElementById("belief-display-card"));
+      document.getElementById("tab-team").appendChild(document.getElementById("map-grid-section"));
+      document.getElementById("tab-team").appendChild(document.getElementById("shared-inspector-card"));
+      document.getElementById("tab-team").appendChild(document.getElementById("assignment-card"));
+      document.getElementById("tab-truth").appendChild(document.getElementById("truth-card"));
+      document.getElementById("tab-network").appendChild(document.getElementById("network-card"));
+    }
+
+    function setActiveTab(tabName) {
+      state.activeTab = tabName;
+
+      try {
+        window.localStorage && window.localStorage.setItem("drone-dashboard-active-tab", tabName);
+      } catch (error) {
+        // Local storage is optional; tab switching must never affect simulation behavior.
+      }
+
+      for (const button of document.querySelectorAll("[data-tab]")) {
+        const selected = button.getAttribute("data-tab") === tabName;
+        button.setAttribute("aria-selected", selected ? "true" : "false");
+        button.setAttribute("tabindex", selected ? "0" : "-1");
+      }
+
+      for (const panel of document.querySelectorAll(".tab-panel")) {
+        panel.classList.toggle("active", panel.id === `tab-${tabName}`);
+      }
+
+      afterLayout(renderMaps);
+    }
+
+    function restoreActiveTab() {
+      let tabName = "team";
+
+      try {
+        tabName = (window.localStorage && window.localStorage.getItem("drone-dashboard-active-tab")) || "team";
+      } catch (error) {
+        tabName = "team";
+      }
+
+      setActiveTab(["team", "truth", "network"].includes(tabName) ? tabName : "team");
+    }
+
+    function setupCanvasResizeObserver() {
+      if (typeof ResizeObserver !== "function") {
+        return;
+      }
+
+      const canvases = [
+        document.getElementById("truth-map"),
+        ...drones.map((drone) => document.getElementById(`belief-map-${drone.id}`)),
+      ];
+      const observer = new ResizeObserver(() => {
+        afterLayout(renderMaps);
+      });
+
+      for (const canvas of canvases) {
+        observer.observe(canvas);
+      }
+    }
+
+    function clearInspectionSelection(message) {
+      state.selectedMapObject = null;
+      state.hoveredMapObject = null;
+      state.selectedObservation = null;
+      state.selectedObservationKey = null;
+      state.selectedObservationSnapshot = null;
+      state.observationSelectionMode = "latest";
+      state.rawJsonOpen = false;
+      state.rawJsonScrollTop = 0;
+      state.rawJsonSelectionStart = 0;
+      state.rawJsonSelectionEnd = 0;
+      state.rawJsonHadFocus = false;
+      state.selectionMessage = message;
+      state.observationTrace.clear();
+    }
+
+    function renderNetwork() {
+      const details = document.getElementById("network-details");
+      const summary = document.getElementById("network-summary");
+      const availableNetworks = drones
+        .map((drone) => state.networks.get(drone.id))
+        .filter(Boolean);
+      const recentlyReachablePeers = availableNetworks.reduce((total, network) => (
+        total + (network.peer_connection_state || []).filter((peer) => peer.reachability === "recently_reachable").length
+      ), 0);
+      const failingPeers = availableNetworks.reduce((total, network) => (
+        total + (network.peer_connection_state || []).filter((peer) => peer.reachability === "failing").length
+      ), 0);
+      const payloadRate = availableNetworks.reduce((total, network) => (
+        total
+        + Number((network.payload_bytes_per_second || {}).sent || 0)
+        + Number((network.payload_bytes_per_second || {}).received || 0)
+      ), 0);
+      const sendFailures = availableNetworks.reduce((total, network) => total + Number(network.send_failures || 0), 0);
+
+      summary.textContent = `${availableNetworks.length}/${drones.length} nodes reporting · ${recentlyReachablePeers} recently reachable peers · ${failingPeers} failing · ${payloadRate.toFixed(1)} B/s JSON payload only · ${sendFailures} send failures`;
+
+      details.innerHTML = drones.map((drone) => {
+        const network = state.networks.get(drone.id);
+
+        if (!network) {
+          return `
+            <div class="control-panel">
+              <h3>${escapeHtml(drone.name)}</h3>
+              <div class="empty-state">Node offline or network diagnostics unavailable.</div>
+            </div>
+          `;
+        }
+
+        return `
+          <div class="control-panel">
+            <h3>${escapeHtml(network.node_name)} · node ${escapeHtml(network.node_id)}</h3>
+            <dl class="diagnostics-grid">
+              <dt>Hostname</dt><dd>${escapeHtml(network.hostname)}</dd>
+              <dt>PID</dt><dd>${escapeHtml(network.pid)}</dd>
+              <dt>Application build</dt><dd>${escapeHtml(network.app_build)}</dd>
+              <dt>API address</dt><dd>${escapeHtml(network.api_address)}</dd>
+              <dt>Configured peers</dt><dd>${(network.configured_peers || []).map(escapeHtml).join("<br>") || "—"}</dd>
+              <dt>Observation messages</dt><dd>${network.observation_messages_sent} sent · ${network.observation_messages_received} received</dd>
+              <dt>Task/config messages</dt><dd>${network.claim_messages_sent} sent · ${network.claim_messages_received} received</dd>
+              <dt>JSON payload bytes</dt><dd>${network.payload_bytes_sent} sent · ${network.payload_bytes_received} received</dd>
+              <dt>Rolling JSON payload rate</dt><dd>${Number(network.payload_bytes_per_second.sent || 0).toFixed(1)} B/s sent · ${Number(network.payload_bytes_per_second.received || 0).toFixed(1)} B/s received · JSON payload only</dd>
+              <dt>Send failures</dt><dd>${network.send_failures || 0}</dd>
+              <dt>Duplicates / rejects</dt><dd>${network.duplicate_observations_ignored} duplicates · ${network.validation_rejects} validation rejects</dd>
+              <dt>Trace retention</dt><dd>${network.trace_retained_count}/${network.trace_retention_limit} retained · ${network.trace_evictions} evicted</dd>
+            </dl>
+            <table class="network-table">
+              <thead><tr><th>Peer</th><th>Reachability</th><th>Last RTT</th><th>Last success</th><th>Latest error</th><th>Sent</th></tr></thead>
+              <tbody>
+                ${(network.peer_connection_state || []).map((peer) => `
+                  <tr>
+                    <td>${escapeHtml(peer.peer)}</td>
+                    <td>${escapeHtml(peer.reachability || "unknown")}</td>
+                    <td>${peer.last_rtt_ms === null || peer.last_rtt_ms === undefined ? "—" : `${Number(peer.last_rtt_ms).toFixed(1)} ms`}</td>
+                    <td>${peer.last_success_wall_time === null || peer.last_success_wall_time === undefined ? "—" : "recorded with monotonic wall time"}</td>
+                    <td>${escapeHtml(peer.latest_error || peer.last_error || "—")}</td>
+                    <td>${escapeHtml(peer.observation_messages_sent || 0)} obs · ${escapeHtml(peer.claim_messages_sent || 0)} task/config · ${escapeHtml(peer.payload_bytes_sent || 0)} bytes · ${escapeHtml(peer.send_failures || 0)} failures</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function traceObservation(observationId) {
+      const rows = await Promise.all(drones.map(async (drone) => {
+        try {
+          return await fetchJson(`${drone.url}/trace?observation_id=${encodeURIComponent(observationId)}`);
+        } catch (error) {
+          return {
+            drone_id: drone.id,
+            drone_name: drone.name,
+            observation_id: observationId,
+            retained_trace_count: 0,
+            trace_evictions: 0,
+            record: null,
+            status: "node_unavailable",
+          };
+        }
+      }));
+      state.observationTrace.set(observationId, rows);
+      refreshMapDetailPanels();
     }
 
     function renderAssignments() {
@@ -1629,6 +2261,12 @@ DASHBOARD_HTML = r"""<!doctype html>
 
       if (applied) {
         state.pendingPlaybookConfig = null;
+        state.playbookSelectDirty = false;
+      }
+
+      const playbookSelect = document.getElementById("playbook-select");
+      if (!state.playbookSelectDirty && playbookSelect.value !== state.selectedPlaybook) {
+        playbookSelect.value = state.selectedPlaybook;
       }
 
       document.getElementById("sharing-button").textContent = state.sharingEnabled ? "Disable sharing" : "Enable sharing";
@@ -1637,8 +2275,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       document.getElementById("scenario-state").textContent = `${state.scenarioName} · seed ${state.scenarioSeed} · priority ${state.priorityObjectCount} · playbook ${state.selectedPlaybook} · build ${state.appBuild}`;
       document.getElementById("task-state").textContent = `${teamSummary.orbiting} orbiting · ${teamSummary.transitioning} transitioning · ${teamSummary.searching} searching · ${teamSummary.queued} queued`;
       document.getElementById("playbook-config-state").textContent = pendingConfig && !applied
-        ? `Playbook ${pendingConfig.playbook} v${pendingConfig.version} pending · ${acknowledgedVersions.join(" · ")}`
-        : `Playbook applied · ${acknowledgedVersions.join(" · ")}`;
+        ? `Requested ${pendingConfig.playbook} v${pendingConfig.version} pending · applied ${state.selectedPlaybook} · ${acknowledgedVersions.join(" · ")}`
+        : `Applied playbook ${state.selectedPlaybook} · ${acknowledgedVersions.join(" · ")}`;
     }
 
     async function postControl(payload, targetDrones = drones) {
@@ -1660,6 +2298,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       await Promise.all(drones.map(updateDrone));
       renderControls();
       renderAssignments();
+      renderNetwork();
       renderMaps();
     }
 
@@ -1702,6 +2341,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     });
 
     document.getElementById("playbook-select").addEventListener("change", (event) => {
+      state.playbookSelectDirty = true;
       applyPlaybookConfiguration(event.target.value);
     });
 
@@ -1744,6 +2384,95 @@ DASHBOARD_HTML = r"""<!doctype html>
       renderMaps();
     });
 
+    document.addEventListener("toggle", (event) => {
+      if (event.target && event.target.id === "observation-json-details") {
+        state.rawJsonOpen = Boolean(event.target.open);
+      }
+    }, true);
+
+    document.addEventListener("scroll", (event) => {
+      if (event.target && event.target.id === "observation-json-area") {
+        state.rawJsonScrollTop = event.target.scrollTop;
+      }
+    }, true);
+
+    document.addEventListener("click", (event) => {
+      const observationButton = event.target.closest("[data-observation-id]");
+      if (observationButton) {
+        const target = latestTargetFor(state.selectedMapObject || state.hoveredMapObject);
+        const observationId = observationButton.getAttribute("data-observation-id");
+        const runId = observationButton.getAttribute("data-observation-run-id");
+
+        if (target && observationId) {
+          const observation = (target.object.measurements || []).find((item) => (
+            item.observation_id === observationId
+            && String(item.scenario_run_id || "unknown-run") === String(runId || "unknown-run")
+          ));
+
+          if (observation) {
+            state.observationSelectionMode = "pinned";
+            state.selectedObservationKey = observationKey(observation);
+            state.selectedObservationSnapshot = snapshotObservation(observation, target);
+            state.rawJsonOpen = true;
+            state.selectionMessage = "";
+            refreshMapDetailPanels();
+          }
+        }
+      }
+
+      const traceButton = event.target.closest("[data-trace-observation-id]");
+      if (traceButton) {
+        traceObservation(traceButton.getAttribute("data-trace-observation-id"));
+      }
+
+      const latestButton = event.target.closest("[data-observation-mode='latest']");
+      if (latestButton) {
+        state.observationSelectionMode = "latest";
+        state.selectedObservationKey = null;
+        state.selectedObservationSnapshot = null;
+        state.rawJsonOpen = true;
+        state.selectionMessage = "";
+        refreshMapDetailPanels();
+      }
+
+      const copyButton = event.target.closest("[data-copy-observation-json]");
+      if (copyButton && state.selectedObservationSnapshot) {
+        navigator.clipboard.writeText(state.selectedObservationSnapshot.rawJson);
+      }
+    });
+
+    function focusTabAtOffset(currentButton, offset) {
+      const buttons = [...document.querySelectorAll("[role='tab']")];
+      const currentIndex = buttons.indexOf(currentButton);
+      const nextButton = buttons[(currentIndex + offset + buttons.length) % buttons.length];
+
+      if (nextButton) {
+        nextButton.focus();
+        setActiveTab(nextButton.getAttribute("data-tab"));
+      }
+    }
+
+    for (const button of document.querySelectorAll("[role='tab']")) {
+      button.addEventListener("click", () => {
+        setActiveTab(button.getAttribute("data-tab"));
+      });
+      button.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowRight") {
+          event.preventDefault();
+          focusTabAtOffset(button, 1);
+        } else if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          focusTabAtOffset(button, -1);
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          focusTabAtOffset(button, -drones.length);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          focusTabAtOffset(button, drones.length);
+        }
+      });
+    }
+
     function setupMapInteractions() {
       const canvases = [
         document.getElementById("truth-map"),
@@ -1766,13 +2495,20 @@ DASHBOARD_HTML = r"""<!doctype html>
 
         canvas.addEventListener("click", (event) => {
           state.selectedMapObject = nearestMapTarget(canvas, event);
+          state.observationSelectionMode = "latest";
+          state.selectedObservationKey = null;
+          state.selectedObservationSnapshot = null;
+          state.selectionMessage = "";
           refreshMapDetailPanels();
         });
       }
     }
 
+    arrangeDashboardTabs();
     drones.forEach(createCard);
     setupMapInteractions();
+    setupCanvasResizeObserver();
+    restoreActiveTab();
     updateAll();
     setInterval(updateAll, 1000);
   </script>
