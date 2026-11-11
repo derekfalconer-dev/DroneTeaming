@@ -128,6 +128,7 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
               networkDetails: document.getElementById("network-details").innerHTML,
               networkSummary: document.getElementById("network-summary").textContent,
               sharedInspector: document.getElementById("shared-inspector").innerHTML,
+              teamConfigState: document.getElementById("team-config-state").textContent,
             }}));
             """
         )
@@ -596,6 +597,35 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
             self.assertNotIn("assigned_remote", output)
 
         self.assertEqual(stale_first, queued_first)
+
+    def test_team_configuration_summary_includes_payload_inventory(self) -> None:
+        fixture = """
+        const now = Date.now() / 1000;
+
+        state.taskSnapshotsByDrone.set(1, {
+          droneId: 1,
+          droneName: "Red",
+          online: true,
+          receivedAt: now,
+          simulationTime: 10,
+          currentMode: "patrol",
+          assignedObjective: null,
+          responseTasks: [],
+          teamConfiguration: {
+            role: "payload",
+            capabilities: ["atr_observe", "payload_drop"],
+            available: true,
+            payload_inventory: { water: 2, medkit: 1 },
+            camera_mount: "fixed",
+          },
+        });
+        renderControls();
+        """
+        output = self.run_dashboard_script(fixture)
+
+        self.assertIn("Red: payload", output["teamConfigState"])
+        self.assertIn("atr_observe/payload_drop", output["teamConfigState"])
+        self.assertIn("inventory medkit×1/water×2", output["teamConfigState"])
 
     def test_readable_task_labels_and_only_current_owner_task_executes(self) -> None:
         fixture = """

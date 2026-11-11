@@ -18,6 +18,8 @@ import uuid
 import webbrowser
 from pathlib import Path
 
+from team_configuration import TeamConfigurationError, load_team_configuration
+
 
 DEFAULT_DASHBOARD_HOST = "127.0.0.1"
 DEFAULT_DASHBOARD_PORT = 8000
@@ -526,6 +528,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     </label>
     <span id="task-state" class="pill">0 orbiting · 0 transitioning · 0 searching · 0 queued</span>
     <span id="playbook-config-state" class="pill">Playbook config pending status unavailable</span>
+    <span id="team-config-state" class="pill">Team config loading…</span>
     <span id="control-state" class="pill">Sharing off · running</span>
     <span id="scenario-state" class="pill">Scenario loading…</span>
   </section>
@@ -798,6 +801,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           responseTasks: status.response_tasks || [],
           responseQueueDepth: Number(status.response_queue_depth || 0),
           playbookConfigVersion: Number(status.playbook_config_version || 0),
+          teamConfiguration: status.team_configuration || null,
         });
 
         card.classList.remove("offline");
@@ -1834,8 +1838,40 @@ DASHBOARD_HTML = r"""<!doctype html>
         .replaceAll("'", "&#39;");
     }
 
+    function taskTypeFor(task) {
+      return task.task_type || "isr_observe";
+    }
+
+    function contactRefFor(task) {
+      return task.contact_ref || task.signature_id || "";
+    }
+
     function taskIdFor(task) {
-      return task.task_id || task.signature_id || task.object_id || "";
+      if (task.task_id) {
+        return task.task_id;
+      }
+
+      if (taskTypeFor(task) === "isr_observe") {
+        return task.signature_id || task.object_id || "";
+      }
+
+      return `${taskTypeFor(task)}:${contactRefFor(task)}`;
+    }
+
+    function taskIdentityKey(task) {
+      return `${taskTypeFor(task)}:${taskIdFor(task)}`;
+    }
+
+    function taskReferenceKeys(task) {
+      const taskType = taskTypeFor(task);
+      const rawReferences = [
+        taskIdFor(task),
+        task.signature_id,
+        task.object_id,
+        contactRefFor(task),
+      ].filter(Boolean);
+
+      return new Set(rawReferences.map((reference) => `${taskType}:${reference}`));
     }
 
     function assignedDroneIdFor(task) {
@@ -1873,7 +1909,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     function taskDisplayName(task, reports = []) {
       const label = task.object_label || task.label || task.classification_label || task.display_label;
-      const baseName = `PRIORITY ${titleCaseLabel(label)}`;
+      const typePrefix = taskTypeFor(task) === "payload_drop" ? "PAYLOAD" : "PRIORITY";
+      const baseName = `${typePrefix} ${titleCaseLabel(label)}`;
       const duplicateCount = reports.filter((report) => {
         const otherLabel = report.task.display_label || report.task.object_label || report.task.label || report.task.classification_label;
         return titleCaseLabel(otherLabel) === titleCaseLabel(label);
@@ -1894,9 +1931,9 @@ DASHBOARD_HTML = r"""<!doctype html>
       const tasks = [...(snapshot.responseTasks || [])];
 
       if (snapshot.responseTask) {
-        const responseTaskId = taskIdFor(snapshot.responseTask);
+        const responseTaskId = taskIdentityKey(snapshot.responseTask);
 
-        if (!responseTaskId || !tasks.some((task) => taskIdFor(task) === responseTaskId)) {
+        if (!responseTaskId || !tasks.some((task) => taskIdentityKey(task) === responseTaskId)) {
           tasks.push(snapshot.responseTask);
         }
       }
@@ -1979,13 +2016,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     function snapshotActiveTaskIds(snapshot) {
       const activeIds = new Set();
 
-      if (snapshot.assignedObjective) {
-        activeIds.add(String(snapshot.assignedObjective));
+      if (snapshot.responseTask) {
+        for (const key of taskReferenceKeys(snapshot.responseTask)) {
+          activeIds.add(key);
+        }
       }
 
-      if (snapshot.responseTask) {
-        activeIds.add(String(snapshot.responseTask.task_id || ""));
-        activeIds.add(String(snapshot.responseTask.signature_id || ""));
+      if (snapshot.assignedObjective) {
+        activeIds.add(`isr_observe:${snapshot.assignedObjective}`);
       }
 
       return activeIds;
@@ -1998,7 +2036,13 @@ DASHBOARD_HTML = r"""<!doctype html>
         return false;
       }
 
-      return activeIds.has(String(report.task.task_id || "")) || activeIds.has(String(report.task.signature_id || ""));
+      for (const key of taskReferenceKeys(report.task)) {
+        if (activeIds.has(key)) {
+          return true;
+        }
+      }
+
+      return false;
     }
 
     function activeTaskForDrone(droneId) {
@@ -2077,7 +2121,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         }
       }
 
-      return String(taskIdFor(left.task)).localeCompare(String(taskIdFor(right.task)));
+      return String(taskIdentityKey(left.task)).localeCompare(String(taskIdentityKey(right.task)));
     }
 
     function authoritativeAssignmentReport(reports) {
@@ -2111,7 +2155,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
       for (const snapshot of state.taskSnapshotsByDrone.values()) {
         for (const task of normalizedTasksForSnapshot(snapshot)) {
-          const taskId = taskIdFor(task);
+          const taskId = taskIdentityKey(task);
 
           if (!taskId) {
             continue;
@@ -2146,10 +2190,13 @@ DASHBOARD_HTML = r"""<!doctype html>
           const conflicts = activeOwnerConflicts(reports, authoritativeReport);
 
           let selectedReport = authoritativeReport;
-          let taskState = "Assigned — activity unknown";
+          let taskState = taskTypeFor(assignedReport.task) === "payload_drop" ? "pending workflow — no execution in this increment" : "Assigned — activity unknown";
           let sourceLabel = ownerReport ? `owner ${snapshotTaskReportAge(ownerReport.snapshot)}` : "owner report unavailable";
 
-          if (ownerCleared || assignedDroneId === null) {
+          if (taskTypeFor(assignedReport.task) === "payload_drop") {
+            taskState = "pending workflow — no execution in this increment";
+            sourceLabel = "payload workflow dormant";
+          } else if (ownerCleared || assignedDroneId === null) {
             taskState = normalizedExecutionState(assignedReport.task.status) || String(assignedReport.task.status || "queued");
             sourceLabel = `${taskState} objective`;
           } else if (freshOwnerActiveReport) {
@@ -2178,6 +2225,7 @@ DASHBOARD_HTML = r"""<!doctype html>
             taskId,
             signatureId: assignedReport.task.signature_id || taskId,
             displayName: taskDisplayName(assignedReport.task, reports),
+            taskType: taskTypeFor(assignedReport.task),
             debugTitle: taskDebugTitle(assignedReport.task),
             assignedDroneName: (assignedDroneId === null || freshOwnerInactiveReport) ? "Unassigned" : assignedDroneNameFor(assignedReport.task),
             taskState,
@@ -2569,10 +2617,11 @@ DASHBOARD_HTML = r"""<!doctype html>
       details.innerHTML = `
         <div>${droneModes}</div>
         <table class="assignment-table">
-          <thead><tr><th>Search objective</th><th>Assigned drone</th><th>Task state</th><th>Last observation age</th><th>Status report</th></tr></thead>
+          <thead><tr><th>Task</th><th>Type</th><th>Assigned drone</th><th>Task state</th><th>Last observation age</th><th>Status report</th></tr></thead>
           <tbody>
             ${rows.map((row) => `<tr>
               <td title="${escapeHtml(row.debugTitle)}">${escapeHtml(row.displayName)}</td>
+              <td>${escapeHtml(row.taskType)}</td>
               <td>${escapeHtml(row.assignedDroneName)}</td>
               <td>${escapeHtml(row.taskState)}</td>
               <td>${escapeHtml(row.observationAge)}</td>
@@ -2685,7 +2734,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     function renderControls() {
-      const teamSummary = buildTeamSummary();
+      const taskSummary = buildTeamSummary();
       const acknowledgedVersions = drones.map((drone) => {
         const status = state.statuses.get(drone.id);
         return `${drone.name} v${status ? Number(status.playbook_config_version || 0) : "offline"}`;
@@ -2738,9 +2787,22 @@ DASHBOARD_HTML = r"""<!doctype html>
 
       document.getElementById("sharing-button").textContent = state.sharingEnabled ? "Disable sharing" : "Enable sharing";
       document.getElementById("pause-button").textContent = state.paused ? "Resume" : "Pause";
+      const teamConfigSummary = drones.map((drone) => {
+        const snapshot = state.taskSnapshotsByDrone.get(drone.id);
+        const config = snapshot && snapshot.teamConfiguration;
+        if (!config) {
+          return `${drone.name}: config unavailable`;
+        }
+        const inventoryEntries = Object.entries(config.payload_inventory || {})
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([payloadType, quantity]) => `${payloadType}×${quantity}`);
+        const inventory = inventoryEntries.length ? inventoryEntries.join("/") : "empty";
+        return `${drone.name}: ${config.role} · ${config.available ? "available" : "unavailable"} · ${config.capabilities.join("/")} · inventory ${inventory}`;
+      }).join(" · ");
+      document.getElementById("team-config-state").textContent = teamConfigSummary;
       document.getElementById("control-state").textContent = `${state.sharingEnabled ? "Sharing on" : "Sharing off"} · ${state.paused ? "paused" : "running"}`;
       document.getElementById("scenario-state").textContent = `${state.scenarioName} · seed ${state.scenarioSeed} · run ${state.scenarioRunId || "—"} · priority ${state.priorityObjectCount} · playbook ${state.selectedPlaybook} · build ${state.appBuild}`;
-      document.getElementById("task-state").textContent = `${teamSummary.orbiting} orbiting · ${teamSummary.transitioning} transitioning · ${teamSummary.searching} searching · ${teamSummary.queued} queued`;
+      document.getElementById("task-state").textContent = `${taskSummary.orbiting} orbiting · ${taskSummary.transitioning} transitioning · ${taskSummary.searching} searching · ${taskSummary.queued} queued`;
       document.getElementById("playbook-config-state").textContent = pendingConfig && !applied
         ? `Requested ${pendingConfig.playbook} v${pendingConfig.version} pending · applied ${state.selectedPlaybook} · ${acknowledgedVersions.join(" · ")}`
         : `Applied playbook ${state.selectedPlaybook} · ${acknowledgedVersions.join(" · ")}`;
@@ -3216,6 +3278,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-observer-id", type=int, choices=(1, 2, 3), default=DEFAULT_INITIAL_OBSERVER_ID)
     parser.add_argument("--next-observer-id", type=int, choices=(1, 2, 3), default=DEFAULT_NEXT_OBSERVER_ID)
     parser.add_argument(
+        "--team-config",
+        default=None,
+        help="Optional JSON team configuration keyed by drone ID.",
+    )
+    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="Start the processes without opening a browser.",
@@ -3248,6 +3315,7 @@ def start_drone_processes(
     initial_observer_id: int,
     next_observer_id: int,
     scenario_run_id: str,
+    team_config_path: Path | None = None,
 ) -> list[subprocess.Popen[str]]:
     drone_script = Path(__file__).with_name("simulated_drone.py")
     processes: list[subprocess.Popen[str]] = []
@@ -3258,35 +3326,40 @@ def start_drone_processes(
             for peer_port in drone_ports
             if peer_port != port
         ]
+        command = [
+            sys.executable,
+            str(drone_script),
+            "--id",
+            str(spec["id"]),
+            "--name",
+            str(spec["name"]),
+            "--host",
+            drone_host,
+            "--port",
+            str(port),
+            "--peers",
+            *peer_urls,
+            "--seed",
+            str(scenario_seed),
+            "--priority-count",
+            str(priority_count),
+            "--playbook",
+            playbook,
+            "--scenario",
+            scenario,
+            "--initial-observer-id",
+            str(initial_observer_id),
+            "--next-observer-id",
+            str(next_observer_id),
+            "--scenario-run-id",
+            scenario_run_id,
+        ]
+
+        if team_config_path is not None:
+            command.extend(["--team-config", str(team_config_path)])
+
         process = subprocess.Popen(
-            [
-                sys.executable,
-                str(drone_script),
-                "--id",
-                str(spec["id"]),
-                "--name",
-                str(spec["name"]),
-                "--host",
-                drone_host,
-                "--port",
-                str(port),
-                "--peers",
-                *peer_urls,
-                "--seed",
-                str(scenario_seed),
-                "--priority-count",
-                str(priority_count),
-                "--playbook",
-                playbook,
-                "--scenario",
-                scenario,
-                "--initial-observer-id",
-                str(initial_observer_id),
-                "--next-observer-id",
-                str(next_observer_id),
-                "--scenario-run-id",
-                scenario_run_id,
-            ],
+            command,
             text=True,
         )
         processes.append(process)
@@ -3339,12 +3412,21 @@ def main() -> int:
         for spec, port in zip(DRONE_SPECS, drone_ports, strict=True)
     ]
 
+    team_config_path = Path(args.team_config).expanduser().resolve() if args.team_config else None
+
     print(f"Launcher path: {Path(__file__).resolve()}")
     print(f"Interpreter path: {sys.executable}")
     print(f"Launcher PID: {os.getpid()}")
     print(f"Application build/version: {APPLICATION_BUILD}")
     print(f"Scenario: {SCENARIO_NAME}")
     print(f"Scenario seed: {DEFAULT_SCENARIO_SEED}")
+    print(f"Team configuration: {team_config_path or 'legacy defaults'}")
+
+    try:
+        load_team_configuration(team_config_path, tuple(int(spec["id"]) for spec in DRONE_SPECS))
+    except TeamConfigurationError as error:
+        print(f"Invalid team configuration: {error}", file=sys.stderr)
+        return 2
 
     playbook = args.playbook if args.playbook != "orbit_follow" else DEFAULT_PLAYBOOK
     initial_observer_id = args.initial_observer_id
@@ -3364,6 +3446,7 @@ def main() -> int:
         initial_observer_id,
         next_observer_id,
         scenario_run_id,
+        team_config_path,
     )
 
     try:

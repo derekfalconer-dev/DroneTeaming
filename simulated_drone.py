@@ -12,6 +12,7 @@ import math
 import os
 import random
 import signal
+import sys
 import socket
 import socketserver
 import threading
@@ -45,6 +46,12 @@ from moving_tracking import (
     predict_state,
     update_with_position,
 )
+from team_configuration import (
+    TeamConfigurationError,
+    TeamMemberConfiguration,
+    load_team_configuration,
+    validate_advertised_team_member,
+)
 
 
 SCHEMA_VERSION = "3.0"
@@ -55,6 +62,10 @@ SCENARIO_OBJECT_COUNT = 24
 MIN_PRIORITY_OBJECT_COUNT = 1
 MAX_PRIORITY_OBJECT_COUNT = 5
 RANDOM_PRIORITY_OBJECT_COUNT = 0
+TASK_TYPE_ISR_OBSERVE = "isr_observe"
+TASK_TYPE_PAYLOAD_DROP = "payload_drop"
+SUPPORTED_TASK_TYPES = {TASK_TYPE_ISR_OBSERVE, TASK_TYPE_PAYLOAD_DROP}
+PAYLOAD_PENDING_STATUS = "pending_workflow"
 PLAYBOOK_REPORT_CONTINUE = "report_continue"
 PLAYBOOK_OBSERVE_ORBIT = "observe_orbit"
 PLAYBOOK_ORBIT_FOLLOW = "orbit_follow"
@@ -193,6 +204,7 @@ class DroneStatus:
     current_mode: str
     assigned_objective: str | None
     diagnostics: dict[str, object]
+    team_configuration: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -544,8 +556,19 @@ def priority_signature_for(seed: int, priority_index: int) -> str:
     return f"{PRIORITY_SIGNATURE_PREFIX}-{hashlib.sha256(f'{seed}:{priority_index}'.encode('utf-8')).hexdigest()[:10]}"
 
 
-def task_id_for_priority_signature(scenario_seed: int, signature_id: str) -> str:
-    return hashlib.sha256(f"{scenario_seed}:{signature_id}".encode("utf-8")).hexdigest()[:18]
+def task_id_for_priority_signature(
+    scenario_seed: int,
+    signature_id: str,
+    task_type: str = TASK_TYPE_ISR_OBSERVE,
+) -> str:
+    if task_type == TASK_TYPE_ISR_OBSERVE:
+        return hashlib.sha256(f"{scenario_seed}:{signature_id}".encode("utf-8")).hexdigest()[:18]
+
+    return hashlib.sha256(f"{scenario_seed}:{task_type}:{signature_id}".encode("utf-8")).hexdigest()[:18]
+
+
+def task_id_for_contact(scenario_seed: int, contact_ref: str, task_type: str) -> str:
+    return task_id_for_priority_signature(scenario_seed, contact_ref, task_type)
 
 
 def generate_moving_handoff_objects() -> list[dict[str, float | str | bool]]:
@@ -718,6 +741,7 @@ class DroneSimulator:
         initial_observer_id: int = DEFAULT_INITIAL_OBSERVER_ID,
         next_observer_id: int = DEFAULT_NEXT_OBSERVER_ID,
         scenario_run_id: str | None = None,
+        team_configuration: dict[int, TeamMemberConfiguration] | None = None,
     ) -> None:
         profile = DRONE_PROFILES[drone_id]
         self.drone_id = drone_id
@@ -750,6 +774,11 @@ class DroneSimulator:
                 if candidate_id != self.initial_observer_id
             )
         self.scenario_run_id = scenario_run_id or str(scenario_seed)
+        self.team_configuration = (
+            team_configuration[drone_id]
+            if team_configuration is not None and drone_id in team_configuration
+            else TeamMemberConfiguration.legacy_default()
+        )
         self.node_session_id = f"{self.drone_id}-{uuid.uuid4().hex[:12]}"
         self.routes = generate_patrol_routes(scenario_seed)
         self.truth_objects = generate_ground_truth_objects(scenario_seed, requested_priority_count, self.scenario_id)
@@ -776,6 +805,7 @@ class DroneSimulator:
         self.claims: dict[str, dict[int, dict[str, object]]] = {}
         self.outbound_claims: list[dict[str, object]] = []
         self.cancelled_priority_signatures: set[str] = set()
+        self.cancelled_task_ids: set[str] = set()
         self.response_east_m: float | None = None
         self.response_north_m: float | None = None
         self.response_heading_deg: float | None = None
@@ -974,6 +1004,7 @@ class DroneSimulator:
                 current_mode=self._current_mode_locked(),
                 assigned_objective=self._assigned_objective_locked(),
                 diagnostics=self._diagnostics_locked(),
+                team_configuration=self.team_configuration.to_dict(),
             )
 
     def truth_payload(self) -> dict[str, object]:
@@ -1080,6 +1111,7 @@ class DroneSimulator:
                 "response_queue_depth": len(self.response_task_queue),
                 "unresolved_observation_count": len(self.unresolved_observations),
                 "diagnostics": self._diagnostics_locked(),
+                "team_configuration": self.team_configuration.to_dict(),
             }
 
     def set_paused(self, paused: bool) -> None:
@@ -1200,6 +1232,7 @@ class DroneSimulator:
             self.claims.clear()
             self.outbound_claims.clear()
             self.cancelled_priority_signatures.clear()
+            self.cancelled_task_ids.clear()
             self.response_east_m = None
             self.response_north_m = None
             self.response_heading_deg = None
@@ -1492,13 +1525,133 @@ class DroneSimulator:
             },
         }
 
+    def _task_contact_ref(self, task: dict[str, object]) -> str:
+        return str(task.get("contact_ref") or task.get("signature_id") or "")
+
+    def _task_type(self, task: dict[str, object]) -> str:
+        return str(task.get("task_type") or TASK_TYPE_ISR_OBSERVE)
+
+    def _task_is_executable_by_this_node_locked(self, task: dict[str, object], excluding_task_id: str | None = None) -> bool:
+        task_type = self._task_type(task)
+
+        if not self.team_configuration.available:
+            return False
+
+        if task_type == TASK_TYPE_ISR_OBSERVE:
+            return (
+                "isr_observe" in self.team_configuration.capabilities
+                and not self._drone_has_active_assignment_locked(self.drone_id, excluding_task_id or str(task.get("task_id", "")))
+            )
+
+        if task_type == TASK_TYPE_PAYLOAD_DROP:
+            requested_payload_type = str(task.get("requested_payload_type", ""))
+            requested_payload_quantity = int(task.get("requested_payload_quantity", 0) or 0)
+            return (
+                "payload_drop" in self.team_configuration.capabilities
+                and requested_payload_quantity > 0
+                and self.team_configuration.payload_inventory.get(requested_payload_type, 0) >= requested_payload_quantity
+                and not self._drone_has_active_assignment_locked(self.drone_id, excluding_task_id or str(task.get("task_id", "")))
+            )
+
+        return False
+
+    def _task_payload_metadata(
+        self,
+        task_type: str,
+        requested_payload_type: str | None = None,
+        requested_payload_quantity: int | None = None,
+    ) -> dict[str, object]:
+        if task_type != TASK_TYPE_PAYLOAD_DROP:
+            return {}
+
+        return {
+            "requested_payload_type": requested_payload_type or "",
+            "requested_payload_quantity": int(requested_payload_quantity or 0),
+            "release_authorization_required": True,
+        }
+
+    def _new_response_task_locked(
+        self,
+        *,
+        contact_ref: str,
+        task_type: str,
+        object_label: str,
+        estimated_east_m: float,
+        estimated_north_m: float,
+        estimated_latitude: float,
+        estimated_longitude: float,
+        last_observation_at: float,
+        status: str,
+        event: str,
+        requested_payload_type: str | None = None,
+        requested_payload_quantity: int | None = None,
+    ) -> dict[str, object]:
+        if task_type not in SUPPORTED_TASK_TYPES:
+            raise ValueError(f"Unsupported task type: {task_type}")
+
+        task_id = task_id_for_contact(self.scenario_seed, contact_ref, task_type)
+        task = {
+            "task_id": task_id,
+            "scenario_run_id": str(self.scenario_seed),
+            "task_type": task_type,
+            "contact_ref": contact_ref,
+            "signature_id": contact_ref,
+            "object_label": object_label,
+            "display_label": self._task_display_label(object_label),
+            "status": status,
+            "selected_playbook": self.selected_playbook,
+            "playbook_config_version": self.playbook_config_version,
+            "created_at": self.simulation_time,
+            "updated_at": self.simulation_time,
+            "last_observation_at": last_observation_at,
+            "election_deadline": self.simulation_time + TASK_ELECTION_SECONDS,
+            "estimated_east_m": estimated_east_m,
+            "estimated_north_m": estimated_north_m,
+            "estimated_latitude": estimated_latitude,
+            "estimated_longitude": estimated_longitude,
+            "assigned_drone_id": None,
+            "assigned_drone_name": None,
+            "orbit_radius_m": ORBIT_RADIUS_M,
+            "revision": 0,
+            "assignment_epoch": 1 if status == "electing" else 0,
+            "event": event,
+            "limitation": RESPONSE_LIMITATION_NOTE,
+        }
+        task.update(self._task_payload_metadata(task_type, requested_payload_type, requested_payload_quantity))
+        return task
+
+    def create_dormant_payload_task_for_contact(
+        self,
+        contact_ref: str,
+        requested_payload_type: str,
+        requested_payload_quantity: int,
+        object_label: str = "payload objective",
+    ) -> dict[str, object]:
+        with self.lock:
+            task = self._new_response_task_locked(
+                contact_ref=contact_ref,
+                task_type=TASK_TYPE_PAYLOAD_DROP,
+                object_label=object_label,
+                estimated_east_m=0.0,
+                estimated_north_m=0.0,
+                estimated_latitude=MAP_REFERENCE_LATITUDE,
+                estimated_longitude=MAP_REFERENCE_LONGITUDE,
+                last_observation_at=self.simulation_time,
+                status=PAYLOAD_PENDING_STATUS,
+                event="Payload delivery workflow is not implemented in this increment.",
+                requested_payload_type=requested_payload_type,
+                requested_payload_quantity=requested_payload_quantity,
+            )
+            self.response_tasks[str(task["task_id"])] = task
+            return dict(task)
+
     def _make_discovered_priorities_available_locked(self) -> None:
         for object_map in self.objects.values():
             if bool(object_map.get("priority", False)) and object_map.get("priority_signature"):
                 self._ensure_response_task_for_priority_object_locked(object_map)
 
         for task_id, task in sorted(self.response_tasks.items()):
-            if str(task.get("signature_id")) in self.cancelled_priority_signatures:
+            if str(task.get("task_id")) in self.cancelled_task_ids:
                 continue
 
             if task.get("status") != "reported":
@@ -1526,10 +1679,10 @@ class DroneSimulator:
     def _ensure_response_task_for_priority_object_locked(self, object_map: dict[str, object]) -> None:
         signature_id = str(object_map["priority_signature"])
 
-        if signature_id in self.cancelled_priority_signatures:
+        if task_id_for_contact(self.scenario_seed, signature_id, TASK_TYPE_ISR_OBSERVE) in self.cancelled_task_ids:
             return
 
-        task_id = task_id_for_priority_signature(self.scenario_seed, signature_id)
+        task_id = task_id_for_contact(self.scenario_seed, signature_id, TASK_TYPE_ISR_OBSERVE)
 
         if task_id in self.response_tasks:
             return
@@ -1539,38 +1692,25 @@ class DroneSimulator:
         infeasible = abs(east_m) + ORBIT_RADIUS_M > SCENARIO_BOUND_EAST_M or abs(north_m) + ORBIT_RADIUS_M > SCENARIO_BOUND_NORTH_M
         local_available = self.active_response_task_id is None
         status = "queued" if not local_available else "electing"
-        task = {
-            "task_id": task_id,
-            "scenario_run_id": str(self.scenario_seed),
-            "signature_id": signature_id,
-            "object_label": str(object_map.get("label", "objective")),
-            "display_label": self._task_display_label(object_map.get("label", "objective")),
-            "status": "infeasible" if infeasible else status,
-            "selected_playbook": self.selected_playbook,
-            "playbook_config_version": self.playbook_config_version,
-            "created_at": self.simulation_time,
-            "updated_at": self.simulation_time,
-            "last_observation_at": float(object_map["last_seen"]),
-            "election_deadline": self.simulation_time + TASK_ELECTION_SECONDS,
-            "estimated_east_m": east_m,
-            "estimated_north_m": north_m,
-            "estimated_latitude": float(object_map["latitude"]),
-            "estimated_longitude": float(object_map["longitude"]),
-            "assigned_drone_id": None,
-            "assigned_drone_name": None,
-            "orbit_radius_m": ORBIT_RADIUS_M,
-            "revision": 0,
-            "assignment_epoch": 1 if status == "electing" else 0,
-            "event": "Previously discovered priority evidence became eligible under observe-and-orbit.",
-            "limitation": RESPONSE_LIMITATION_NOTE,
-        }
+        task = self._new_response_task_locked(
+            contact_ref=signature_id,
+            task_type=TASK_TYPE_ISR_OBSERVE,
+            object_label=str(object_map.get("label", "objective")),
+            estimated_east_m=east_m,
+            estimated_north_m=north_m,
+            estimated_latitude=float(object_map["latitude"]),
+            estimated_longitude=float(object_map["longitude"]),
+            last_observation_at=float(object_map["last_seen"]),
+            status="infeasible" if infeasible else status,
+            event="Previously discovered priority evidence became eligible under observe-and-orbit.",
+        )
         self.response_tasks[task_id] = task
 
         if infeasible:
             task["event"] = "Requested orbit is infeasible within scenario bounds."
             return
 
-        if local_available:
+        if local_available and self._task_is_executable_by_this_node_locked(task):
             self.active_response_task_id = task_id
             claim = self._task_claim_payload_locked(task)
             self.claims.setdefault(task_id, {})[self.drone_id] = claim
@@ -1592,7 +1732,7 @@ class DroneSimulator:
 
     def _release_active_response_tasks_locked(self) -> None:
         for task_id, task in self.response_tasks.items():
-            if str(task.get("signature_id")) in self.cancelled_priority_signatures:
+            if str(task.get("task_id")) in self.cancelled_task_ids:
                 continue
 
             if task.get("assigned_drone_id") == self.drone_id and task.get("status") in {"transitioning", "orbiting"}:
@@ -2510,20 +2650,25 @@ class DroneSimulator:
         east_m = float(task["estimated_east_m"])
         north_m = float(task["estimated_north_m"])
         revision = int(task.get("revision", 0)) + (0 if status == "claiming" else 1)
+        task_type = self._task_type(task)
+        contact_ref = self._task_contact_ref(task)
 
         if status != "claiming":
             task["revision"] = revision
 
-        return {
+        payload = {
             "schema_version": SCHEMA_VERSION,
             "app_build": APPLICATION_BUILD,
             "scenario_run_id": str(self.scenario_seed),
             "task_id": str(task["task_id"]),
+            "task_type": task_type,
+            "contact_ref": contact_ref,
             "signature_id": str(task["signature_id"]),
             "object_label": str(task.get("object_label", "objective")),
             "display_label": str(task.get("display_label", self._task_display_label(task.get("object_label", "objective")))),
             "claimant_drone_id": self.drone_id,
             "claimant_drone_name": self.name,
+            "claimant_team_configuration": self.team_configuration.to_dict(),
             "owner_drone_id": task.get("assigned_drone_id"),
             "owner_drone_name": task.get("assigned_drone_name"),
             "status": status,
@@ -2543,12 +2688,23 @@ class DroneSimulator:
             "election_deadline": float(task["election_deadline"]),
         }
 
+        if task_type == TASK_TYPE_PAYLOAD_DROP:
+            payload.update(
+                {
+                    "requested_payload_type": str(task.get("requested_payload_type", "")),
+                    "requested_payload_quantity": int(task.get("requested_payload_quantity", 0) or 0),
+                    "release_authorization_required": bool(task.get("release_authorization_required", True)),
+                },
+            )
+
+        return payload
+
     def _ensure_response_task_locked(self, observation: Observation, object_map: dict[str, object]) -> None:
         assert observation.priority_evidence is not None
         signature_id = str(observation.priority_evidence["signature_id"])
-        task_id = task_id_for_priority_signature(self.scenario_seed, signature_id)
+        task_id = task_id_for_contact(self.scenario_seed, signature_id, TASK_TYPE_ISR_OBSERVE)
 
-        if signature_id in self.cancelled_priority_signatures:
+        if task_id in self.cancelled_task_ids:
             return
 
         if task_id in self.response_tasks:
@@ -2564,38 +2720,25 @@ class DroneSimulator:
         infeasible = abs(east_m) + ORBIT_RADIUS_M > SCENARIO_BOUND_EAST_M or abs(north_m) + ORBIT_RADIUS_M > SCENARIO_BOUND_NORTH_M
         local_available = self.active_response_task_id is None
         status = "queued" if not local_available else "electing"
-        task = {
-            "task_id": task_id,
-            "scenario_run_id": str(self.scenario_seed),
-            "signature_id": signature_id,
-            "object_label": observation.label,
-            "display_label": self._task_display_label(observation.label),
-            "status": "infeasible" if infeasible else status,
-            "selected_playbook": self.selected_playbook,
-            "playbook_config_version": self.playbook_config_version,
-            "created_at": self.simulation_time,
-            "updated_at": self.simulation_time,
-            "last_observation_at": observation.timestamp,
-            "election_deadline": self.simulation_time + TASK_ELECTION_SECONDS,
-            "estimated_east_m": east_m,
-            "estimated_north_m": north_m,
-            "estimated_latitude": float(object_map["latitude"]),
-            "estimated_longitude": float(object_map["longitude"]),
-            "assigned_drone_id": None,
-            "assigned_drone_name": None,
-            "orbit_radius_m": ORBIT_RADIUS_M,
-            "revision": 0,
-            "assignment_epoch": 1 if status == "electing" else 0,
-            "event": "Priority evidence accepted; deterministic claim election started.",
-            "limitation": RESPONSE_LIMITATION_NOTE,
-        }
+        task = self._new_response_task_locked(
+            contact_ref=signature_id,
+            task_type=TASK_TYPE_ISR_OBSERVE,
+            object_label=observation.label,
+            estimated_east_m=east_m,
+            estimated_north_m=north_m,
+            estimated_latitude=float(object_map["latitude"]),
+            estimated_longitude=float(object_map["longitude"]),
+            last_observation_at=observation.timestamp,
+            status="infeasible" if infeasible else status,
+            event="Priority evidence accepted; deterministic claim election started.",
+        )
         self.response_tasks[task_id] = task
 
         if infeasible:
             task["event"] = "Requested orbit is infeasible within scenario bounds."
             return
 
-        if local_available:
+        if local_available and self._task_is_executable_by_this_node_locked(task):
             self.active_response_task_id = task_id
             claim = self._task_claim_payload_locked(task)
             self.claims.setdefault(task_id, {})[self.drone_id] = claim
@@ -2633,6 +2776,33 @@ class DroneSimulator:
             return False
 
         claimant_drone_id = int(claim["claimant_drone_id"])
+        task_type = self._task_type(task)
+        advertised = claim.get("claimant_team_configuration")
+
+        if isinstance(advertised, dict):
+            try:
+                advertised_config = TeamMemberConfiguration.from_mapping(advertised)
+            except TeamConfigurationError:
+                return False
+
+            if task_type == TASK_TYPE_ISR_OBSERVE and ("isr_observe" not in advertised_config.capabilities or not advertised_config.available):
+                return False
+            if task_type == TASK_TYPE_PAYLOAD_DROP:
+                requested_payload_type = str(task.get("requested_payload_type", ""))
+                requested_payload_quantity = int(task.get("requested_payload_quantity", 0) or 0)
+                if (
+                    "payload_drop" not in advertised_config.capabilities
+                    or not advertised_config.available
+                    or requested_payload_quantity <= 0
+                    or advertised_config.payload_inventory.get(requested_payload_type, 0) < requested_payload_quantity
+                ):
+                    return False
+        elif task_type != TASK_TYPE_ISR_OBSERVE:
+            return False
+
+        if claimant_drone_id == self.drone_id and not self._task_is_executable_by_this_node_locked(task, str(task["task_id"])):
+            return False
+
         return not self._drone_has_active_assignment_locked(claimant_drone_id, str(task["task_id"]))
 
     def _release_current_assignment_locked(self, task: dict[str, object], owner_task_state: str = "released") -> None:
@@ -2648,13 +2818,13 @@ class DroneSimulator:
         if self.selected_playbook != PLAYBOOK_OBSERVE_ORBIT:
             return
 
-        if str(task.get("signature_id")) in self.cancelled_priority_signatures:
+        if str(task.get("task_id")) in self.cancelled_task_ids:
             return
 
         if task.get("status") not in {"reported", "released"}:
             return
 
-        if self.active_response_task_id is None:
+        if self.active_response_task_id is None and self._task_is_executable_by_this_node_locked(task):
             task["status"] = "electing"
             task["assignment_epoch"] = int(task.get("assignment_epoch", 0)) + 1
             task["election_deadline"] = self.simulation_time + TASK_ELECTION_SECONDS
@@ -2666,7 +2836,7 @@ class DroneSimulator:
             claim = self._task_claim_payload_locked(task)
             self.claims.setdefault(task_id, {})[self.drone_id] = claim
             self.outbound_claims.append(claim)
-        elif task_id not in self.response_task_queue:
+        elif task_id not in self.response_task_queue and self._task_type(task) == TASK_TYPE_ISR_OBSERVE:
             task["status"] = "queued"
             task["playbook_config_version"] = self.playbook_config_version
             task["updated_at"] = self.simulation_time
@@ -2687,50 +2857,63 @@ class DroneSimulator:
 
         task_id = str(payload["task_id"])
         claimant_drone_id = int(payload["claimant_drone_id"])
+        task_type = str(payload.get("task_type", TASK_TYPE_ISR_OBSERVE))
+        contact_ref = str(payload.get("contact_ref", payload.get("signature_id", "")))
+
+        if task_type not in SUPPORTED_TASK_TYPES:
+            return False
+
+        expected_task_id = task_id_for_contact(self.scenario_seed, contact_ref, task_type)
+        if task_id != expected_task_id:
+            return False
+
+        if "claimant_team_configuration" in payload:
+            try:
+                validate_advertised_team_member(payload["claimant_team_configuration"])
+            except TeamConfigurationError:
+                return False
         east_m = float(payload["estimated_east_m"])
         north_m = float(payload["estimated_north_m"])
         latitude, longitude = local_m_to_lat_lon(east_m, north_m)
         payload_status = str(payload.get("task_state", payload.get("status", "claiming")))
-        signature_id = str(payload.get("signature_id", task_id))
+        signature_id = str(payload.get("signature_id", contact_ref))
         revision = int(payload.get("revision", 0))
 
         if task_id not in self.response_tasks:
-            status = "queued" if self.active_response_task_id is not None else "electing"
-            self.response_tasks[task_id] = {
-                "task_id": task_id,
-                "scenario_run_id": str(self.scenario_seed),
-                "signature_id": signature_id,
-                "object_label": str(payload.get("object_label", "objective")),
-                "display_label": str(payload.get("display_label", self._task_display_label(payload.get("object_label", "objective")))),
-                "status": status,
-                "selected_playbook": self.selected_playbook,
-                "playbook_config_version": self.playbook_config_version,
-                "created_at": self.simulation_time,
-                "updated_at": self.simulation_time,
-                "last_observation_at": float(payload.get("updated_at", self.simulation_time)),
-                "election_deadline": max(self.simulation_time + TASK_ELECTION_SECONDS, float(payload.get("election_deadline", self.simulation_time))),
-                "estimated_east_m": east_m,
-                "estimated_north_m": north_m,
-                "estimated_latitude": latitude,
-                "estimated_longitude": longitude,
-                "assigned_drone_id": None,
-                "assigned_drone_name": None,
-                "orbit_radius_m": ORBIT_RADIUS_M,
-                "revision": 0,
-                "assignment_epoch": int(payload.get("assignment_epoch", 0)),
-                "event": "Peer claim received; local deterministic election joined.",
-                "limitation": RESPONSE_LIMITATION_NOTE,
-            }
+            if task_type == TASK_TYPE_PAYLOAD_DROP:
+                return False
 
-            if self.active_response_task_id is None:
+            self.response_tasks[task_id] = self._new_response_task_locked(
+                contact_ref=contact_ref,
+                task_type=task_type,
+                object_label=str(payload.get("object_label", "objective")),
+                estimated_east_m=east_m,
+                estimated_north_m=north_m,
+                estimated_latitude=latitude,
+                estimated_longitude=longitude,
+                last_observation_at=float(payload.get("updated_at", self.simulation_time)),
+                status="queued",
+                event="Peer claim received; local deterministic election joined if this node is eligible.",
+            )
+            self.response_tasks[task_id]["election_deadline"] = max(self.simulation_time + TASK_ELECTION_SECONDS, float(payload.get("election_deadline", self.simulation_time)))
+            self.response_tasks[task_id]["assignment_epoch"] = int(payload.get("assignment_epoch", 0))
+
+            if self.active_response_task_id is None and self._task_is_executable_by_this_node_locked(self.response_tasks[task_id]):
+                self.response_tasks[task_id]["status"] = "electing"
                 self.active_response_task_id = task_id
                 local_claim = self._task_claim_payload_locked(self.response_tasks[task_id])
                 self.claims.setdefault(task_id, {})[self.drone_id] = local_claim
                 self.outbound_claims.append(local_claim)
-            else:
+            elif task_id not in self.response_task_queue:
                 self.response_task_queue.append(task_id)
 
         task = self.response_tasks[task_id]
+
+        if self._task_type(task) != task_type or self._task_contact_ref(task) != contact_ref:
+            return False
+
+        if task_type == TASK_TYPE_PAYLOAD_DROP and payload_status not in {PAYLOAD_PENDING_STATUS, "cancelled"}:
+            return False
 
         if payload_status in {"transitioning", "orbiting", "reported", "cancelled", "released"}:
             current_revision = int(task.get("revision", 0))
@@ -2776,14 +2959,18 @@ class DroneSimulator:
                 if current_owner_int not in {payload_owner_int, claimant_drone_id}:
                     return False
 
-            if (
-                payload_status in {"transitioning", "orbiting"}
-                and owner_drone_id is not None
-                and int(owner_drone_id) == self.drone_id
-                and self._drone_has_active_assignment_locked(self.drone_id, task_id)
-            ):
-                self._make_task_allocatable_locked(task_id, task)
-                return False
+            if payload_status in {"transitioning", "orbiting"} and owner_drone_id is not None:
+                try:
+                    incoming_owner_int = int(owner_drone_id)
+                except (TypeError, ValueError):
+                    return False
+
+                if incoming_owner_int == self.drone_id and not self._task_is_executable_by_this_node_locked(task, task_id):
+                    return False
+
+                if incoming_owner_int == self.drone_id and self._drone_has_active_assignment_locked(self.drone_id, task_id):
+                    self._make_task_allocatable_locked(task_id, task)
+                    return False
 
             task["revision"] = revision
             task["assignment_epoch"] = max(current_epoch, incoming_epoch)
@@ -2802,7 +2989,7 @@ class DroneSimulator:
                 task["assigned_drone_id"] = None
                 task["assigned_drone_name"] = None
                 task["status"] = "cancelled"
-                self.cancelled_priority_signatures.add(signature_id)
+                self.cancelled_task_ids.add(task_id)
 
                 if task_id in self.response_task_queue:
                     self.response_task_queue.remove(task_id)
@@ -2919,7 +3106,7 @@ class DroneSimulator:
             if self._claim_is_current_and_available_locked(claim, task)
         ]
 
-        if not claims and not self._drone_has_active_assignment_locked(self.drone_id, str(task["task_id"])):
+        if not claims and self._task_is_executable_by_this_node_locked(task):
             claim = self._task_claim_payload_locked(task)
             self.claims.setdefault(str(task["task_id"]), {})[self.drone_id] = claim
             self.outbound_claims.append(claim)
@@ -2989,7 +3176,9 @@ class DroneSimulator:
             task_id
             for task_id in self.response_task_queue
             if self.response_tasks.get(task_id, {}).get("status") == "queued"
-            and str(self.response_tasks.get(task_id, {}).get("signature_id")) not in self.cancelled_priority_signatures
+            and str(self.response_tasks.get(task_id, {}).get("task_id")) not in self.cancelled_task_ids
+            and self._task_type(self.response_tasks.get(task_id, {})) == TASK_TYPE_ISR_OBSERVE
+            and self._task_is_executable_by_this_node_locked(self.response_tasks.get(task_id, {}), task_id)
         ]
 
         if not queued_task_ids:
@@ -3100,7 +3289,7 @@ class DroneSimulator:
 
             if task is not None:
                 signature_id = str(task["signature_id"])
-                self.cancelled_priority_signatures.add(signature_id)
+                self.cancelled_task_ids.add(str(task["task_id"]))
                 task["previous_assigned_drone_id"] = task.get("assigned_drone_id")
                 task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
                 task["assigned_drone_id"] = None
@@ -3302,11 +3491,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-observer-id", type=int, choices=sorted(DRONE_PROFILES), default=DEFAULT_INITIAL_OBSERVER_ID)
     parser.add_argument("--next-observer-id", type=int, choices=sorted(DRONE_PROFILES), default=DEFAULT_NEXT_OBSERVER_ID)
     parser.add_argument("--scenario-run-id", default=None)
+    parser.add_argument("--team-config", default=None)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    try:
+        team_config = load_team_configuration(args.team_config, tuple(sorted(DRONE_PROFILES))).members
+    except TeamConfigurationError as error:
+        print(f"Invalid team configuration: {error}", file=sys.stderr)
+        return 2
+
     DroneRequestHandler.simulator = DroneSimulator(
         args.drone_id,
         args.name,
@@ -3320,6 +3516,7 @@ def main() -> int:
         args.initial_observer_id,
         args.next_observer_id,
         args.scenario_run_id,
+        dict(team_config),
     )
 
     stop_event = threading.Event()
