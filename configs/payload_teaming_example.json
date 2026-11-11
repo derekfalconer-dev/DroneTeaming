@@ -1,0 +1,27 @@
+{
+  "1": {
+    "role": "isr",
+    "capabilities": ["atr_observe", "isr_observe"],
+    "available": true,
+    "payload_inventory": {},
+    "camera_mount": "steerable"
+  },
+  "2": {
+    "role": "payload",
+    "capabilities": ["payload_drop"],
+    "available": true,
+    "payload_inventory": {
+      "rescue_kit": 2
+    },
+    "camera_mount": "steerable"
+  },
+  "3": {
+    "role": "generalist",
+    "capabilities": ["atr_observe", "isr_observe", "payload_drop"],
+    "available": true,
+    "payload_inventory": {
+      "rescue_kit": 1
+    },
+    "camera_mount": "steerable"
+  }
+}

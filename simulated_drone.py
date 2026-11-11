@@ -66,6 +66,20 @@ TASK_TYPE_ISR_OBSERVE = "isr_observe"
 TASK_TYPE_PAYLOAD_DROP = "payload_drop"
 SUPPORTED_TASK_TYPES = {TASK_TYPE_ISR_OBSERVE, TASK_TYPE_PAYLOAD_DROP}
 PAYLOAD_PENDING_STATUS = "pending_workflow"
+PAYLOAD_REQUEST_REPORTED_STATUS = "reported"
+PAYLOAD_APPROACHING_STATUS = "approaching_payload"
+PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS = "awaiting_local_acquisition"
+PAYLOAD_WAITING_FOR_TRACK_STATUS = "waiting_for_track"
+PAYLOAD_EXECUTION_STATUSES = {
+    PAYLOAD_APPROACHING_STATUS,
+    PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS,
+    PAYLOAD_WAITING_FOR_TRACK_STATUS,
+}
+PAYLOAD_STATE_HEARTBEAT_SECONDS = 5.0
+DEFAULT_PAYLOAD_REQUESTS_ENABLED = False
+DEFAULT_PAYLOAD_TYPE = "rescue_kit"
+DEFAULT_PAYLOAD_QUANTITY = 1
+DEFAULT_PAYLOAD_STANDOFF_M = 45.0
 PLAYBOOK_REPORT_CONTINUE = "report_continue"
 PLAYBOOK_OBSERVE_ORBIT = "observe_orbit"
 PLAYBOOK_ORBIT_FOLLOW = "orbit_follow"
@@ -742,6 +756,10 @@ class DroneSimulator:
         next_observer_id: int = DEFAULT_NEXT_OBSERVER_ID,
         scenario_run_id: str | None = None,
         team_configuration: dict[int, TeamMemberConfiguration] | None = None,
+        payload_requests_enabled: bool = DEFAULT_PAYLOAD_REQUESTS_ENABLED,
+        requested_payload_type: str = DEFAULT_PAYLOAD_TYPE,
+        requested_payload_quantity: int = DEFAULT_PAYLOAD_QUANTITY,
+        payload_standoff_m: float = DEFAULT_PAYLOAD_STANDOFF_M,
     ) -> None:
         profile = DRONE_PROFILES[drone_id]
         self.drone_id = drone_id
@@ -779,6 +797,10 @@ class DroneSimulator:
             if team_configuration is not None and drone_id in team_configuration
             else TeamMemberConfiguration.legacy_default()
         )
+        self.payload_requests_enabled = bool(payload_requests_enabled)
+        self.requested_payload_type = requested_payload_type
+        self.requested_payload_quantity = max(1, int(requested_payload_quantity))
+        self.payload_standoff_m = max(1.0, float(payload_standoff_m))
         self.node_session_id = f"{self.drone_id}-{uuid.uuid4().hex[:12]}"
         self.routes = generate_patrol_routes(scenario_seed)
         self.truth_objects = generate_ground_truth_objects(scenario_seed, requested_priority_count, self.scenario_id)
@@ -806,6 +828,7 @@ class DroneSimulator:
         self.outbound_claims: list[dict[str, object]] = []
         self.cancelled_priority_signatures: set[str] = set()
         self.cancelled_task_ids: set[str] = set()
+        self.payload_reservations_by_task: dict[str, dict[str, object]] = {}
         self.response_east_m: float | None = None
         self.response_north_m: float | None = None
         self.response_heading_deg: float | None = None
@@ -864,6 +887,7 @@ class DroneSimulator:
             self._reconcile_eligible_work_locked()
             self._resolve_response_tasks_locked()
             self._update_response_guidance_locked(elapsed)
+            self._update_payload_guidance_locked(elapsed)
             self._update_return_to_patrol_locked(elapsed)
             self._process_moving_report_buffer_locked()
 
@@ -872,7 +896,7 @@ class DroneSimulator:
         self.last_wall_time = now
 
     def _pose_at_locked(self) -> tuple[float, float, float]:
-        if self._has_local_response_control_locked():
+        if self._has_local_execution_control_locked():
             assert self.response_east_m is not None
             assert self.response_north_m is not None
             assert self.response_heading_deg is not None
@@ -1031,6 +1055,11 @@ class DroneSimulator:
                 "response_tasks": self._visible_response_tasks_locked(),
                 "response_queue_depth": len(self.response_task_queue),
                 "orbit_radius_m": ORBIT_RADIUS_M,
+                "payload_requests_enabled": self.payload_requests_enabled,
+                "requested_payload_type": self.requested_payload_type,
+                "requested_payload_quantity": self.requested_payload_quantity,
+                "payload_standoff_m": self.payload_standoff_m,
+                "payload_reservations": dict(self.payload_reservations_by_task),
                 "response_limitation_note": RESPONSE_LIMITATION_NOTE,
                 "objects": list(self.truth_objects),
             }
@@ -1075,6 +1104,11 @@ class DroneSimulator:
                 "response_tasks": self._visible_response_tasks_locked(),
                 "response_queue_depth": len(self.response_task_queue),
                 "orbit_radius_m": ORBIT_RADIUS_M,
+                "payload_requests_enabled": self.payload_requests_enabled,
+                "requested_payload_type": self.requested_payload_type,
+                "requested_payload_quantity": self.requested_payload_quantity,
+                "payload_standoff_m": self.payload_standoff_m,
+                "payload_reservations": dict(self.payload_reservations_by_task),
                 "objects": sorted(
                     objects,
                     key=lambda item: str(item["object_id"]),
@@ -1110,6 +1144,11 @@ class DroneSimulator:
                 "response_tasks": self._visible_response_tasks_locked(),
                 "response_queue_depth": len(self.response_task_queue),
                 "unresolved_observation_count": len(self.unresolved_observations),
+                "payload_requests_enabled": self.payload_requests_enabled,
+                "requested_payload_type": self.requested_payload_type,
+                "requested_payload_quantity": self.requested_payload_quantity,
+                "payload_standoff_m": self.payload_standoff_m,
+                "payload_reservations": dict(self.payload_reservations_by_task),
                 "diagnostics": self._diagnostics_locked(),
                 "team_configuration": self.team_configuration.to_dict(),
             }
@@ -1159,6 +1198,28 @@ class DroneSimulator:
                 self._release_active_response_tasks_locked()
 
             return True
+
+    def configure_payload_requests(
+        self,
+        enabled: bool | None = None,
+        payload_type: str | None = None,
+        quantity: int | None = None,
+        stand_off_m: float | None = None,
+    ) -> None:
+        with self.lock:
+            if enabled is not None:
+                self.payload_requests_enabled = bool(enabled)
+
+            if payload_type is not None:
+                payload_type = payload_type.strip()
+                if payload_type:
+                    self.requested_payload_type = payload_type
+
+            if quantity is not None:
+                self.requested_payload_quantity = max(1, int(quantity))
+
+            if stand_off_m is not None:
+                self.payload_standoff_m = max(1.0, float(stand_off_m))
 
     def reset(
         self,
@@ -1233,6 +1294,7 @@ class DroneSimulator:
             self.outbound_claims.clear()
             self.cancelled_priority_signatures.clear()
             self.cancelled_task_ids.clear()
+            self.payload_reservations_by_task.clear()
             self.response_east_m = None
             self.response_north_m = None
             self.response_heading_deg = None
@@ -1513,6 +1575,15 @@ class DroneSimulator:
             "current_mode": self._current_mode_locked(),
             "assigned_objective": self._assigned_objective_locked(),
             "response_limitation_note": RESPONSE_LIMITATION_NOTE,
+            "payload_drop": {
+                "requests_enabled": self.payload_requests_enabled,
+                "requested_payload_type": self.requested_payload_type,
+                "requested_payload_quantity": self.requested_payload_quantity,
+                "stand_off_m": self.payload_standoff_m,
+                "reserved_inventory": dict(self.payload_reservations_by_task),
+                "available_inventory_after_reservations": self._available_payload_inventory_locked(),
+                "note": "Increment 2 supports approach to a shared contact estimate only; release, inventory consumption, and delivery confirmation are not implemented.",
+            },
             "moving_tracking": {
                 "report_schema_version": TRACK_REPORT_SCHEMA_VERSION,
                 "buffer_seconds": MOVING_TRACK_BUFFER_SECONDS,
@@ -1549,17 +1620,69 @@ class DroneSimulator:
             return (
                 "payload_drop" in self.team_configuration.capabilities
                 and requested_payload_quantity > 0
-                and self.team_configuration.payload_inventory.get(requested_payload_type, 0) >= requested_payload_quantity
+                and self._available_payload_inventory_locked(excluding_task_id or str(task.get("task_id", ""))).get(requested_payload_type, 0) >= requested_payload_quantity
                 and not self._drone_has_active_assignment_locked(self.drone_id, excluding_task_id or str(task.get("task_id", "")))
             )
 
         return False
+
+    def _available_payload_inventory_locked(self, excluding_task_id: str | None = None) -> dict[str, int]:
+        available = dict(self.team_configuration.payload_inventory)
+        for task_id, reservation in self.payload_reservations_by_task.items():
+            if excluding_task_id is not None and task_id == excluding_task_id:
+                continue
+
+            payload_type = str(reservation.get("payload_type", ""))
+            quantity = int(reservation.get("quantity", 0) or 0)
+            available[payload_type] = max(0, available.get(payload_type, 0) - quantity)
+
+        return available
+
+    def _reserve_payload_inventory_locked(self, task: dict[str, object]) -> None:
+        if self._task_type(task) != TASK_TYPE_PAYLOAD_DROP:
+            return
+
+        task_id = str(task["task_id"])
+        payload_type = str(task.get("requested_payload_type", ""))
+        quantity = int(task.get("requested_payload_quantity", 0) or 0)
+
+        if quantity <= 0 or not payload_type:
+            return
+
+        existing = self.payload_reservations_by_task.get(task_id)
+        if existing is not None:
+            task["reservation_state"] = "reserved"
+            task["reserved_payload_quantity"] = int(existing.get("quantity", quantity))
+            return
+
+        if self._available_payload_inventory_locked(task_id).get(payload_type, 0) < quantity:
+            task["reservation_state"] = "reservation_failed"
+            task["event"] = "Payload assignment could not reserve sufficient inventory."
+            return
+
+        self.payload_reservations_by_task[task_id] = {
+            "payload_type": payload_type,
+            "quantity": quantity,
+            "reserved_at": self.simulation_time,
+        }
+        task["reservation_state"] = "reserved"
+        task["reserved_payload_quantity"] = quantity
+
+    def _release_payload_reservation_locked(self, task: dict[str, object]) -> None:
+        if self._task_type(task) != TASK_TYPE_PAYLOAD_DROP:
+            return
+
+        task_id = str(task.get("task_id", ""))
+        self.payload_reservations_by_task.pop(task_id, None)
+        task["reservation_state"] = "released"
+        task["reserved_payload_quantity"] = 0
 
     def _task_payload_metadata(
         self,
         task_type: str,
         requested_payload_type: str | None = None,
         requested_payload_quantity: int | None = None,
+        contact_ref: str | None = None,
     ) -> dict[str, object]:
         if task_type != TASK_TYPE_PAYLOAD_DROP:
             return {}
@@ -1568,6 +1691,11 @@ class DroneSimulator:
             "requested_payload_type": requested_payload_type or "",
             "requested_payload_quantity": int(requested_payload_quantity or 0),
             "release_authorization_required": True,
+            "contact_ref": contact_ref or "",
+            "reservation_state": "not_reserved",
+            "reserved_payload_quantity": 0,
+            "payload_standoff_m": self.payload_standoff_m,
+            "execution_note": "Approach only; terminal guidance, authorization, release, inventory consumption, and delivery confirmation are out of scope.",
         }
 
     def _new_response_task_locked(
@@ -1617,7 +1745,62 @@ class DroneSimulator:
             "event": event,
             "limitation": RESPONSE_LIMITATION_NOTE,
         }
-        task.update(self._task_payload_metadata(task_type, requested_payload_type, requested_payload_quantity))
+        task.update(self._task_payload_metadata(task_type, requested_payload_type, requested_payload_quantity, contact_ref))
+        return task
+
+    def _payload_request_metadata_matches(self, task: dict[str, object], payload_type: str, quantity: int) -> bool:
+        return (
+            self._task_type(task) == TASK_TYPE_PAYLOAD_DROP
+            and str(task.get("requested_payload_type", "")) == payload_type
+            and int(task.get("requested_payload_quantity", 0) or 0) == int(quantity)
+        )
+
+    def _ensure_payload_request_for_priority_object_locked(self, object_map: dict[str, object]) -> dict[str, object] | None:
+        if not self.payload_requests_enabled:
+            return None
+
+        if "isr_observe" not in self.team_configuration.capabilities or not self.team_configuration.available:
+            return None
+
+        signature_id = str(object_map.get("priority_signature") or "")
+        if not signature_id:
+            return None
+
+        task_id = task_id_for_contact(self.scenario_seed, signature_id, TASK_TYPE_PAYLOAD_DROP)
+        if task_id in self.cancelled_task_ids:
+            return None
+
+        if task_id in self.response_tasks:
+            task = self.response_tasks[task_id]
+            if not self._payload_request_metadata_matches(task, self.requested_payload_type, self.requested_payload_quantity):
+                task["metadata_conflict"] = True
+                task["event"] = "Conflicting payload request metadata rejected; existing request was not overwritten."
+                return None
+
+            task["last_observation_at"] = max(float(task.get("last_observation_at", 0.0)), float(object_map.get("last_seen", 0.0)))
+            task["updated_at"] = self.simulation_time
+            return task
+
+        task = self._new_response_task_locked(
+            contact_ref=signature_id,
+            task_type=TASK_TYPE_PAYLOAD_DROP,
+            object_label=str(object_map.get("label", "payload objective")),
+            estimated_east_m=float(object_map["east_m"]),
+            estimated_north_m=float(object_map["north_m"]),
+            estimated_latitude=float(object_map["latitude"]),
+            estimated_longitude=float(object_map["longitude"]),
+            last_observation_at=float(object_map["last_seen"]),
+            status=PAYLOAD_REQUEST_REPORTED_STATUS,
+            event="ISR contact evidence accepted; payload-drop request published.",
+            requested_payload_type=self.requested_payload_type,
+            requested_payload_quantity=self.requested_payload_quantity,
+        )
+        task["assignment_epoch"] = 1
+        task["requesting_drone_id"] = self.drone_id
+        task["requesting_drone_name"] = self.name
+        self.response_tasks[task_id] = task
+        self.outbound_claims.append(self._task_claim_payload_locked(task, PAYLOAD_REQUEST_REPORTED_STATUS))
+        self._make_task_allocatable_locked(task_id, task)
         return task
 
     def create_dormant_payload_task_for_contact(
@@ -1660,6 +1843,9 @@ class DroneSimulator:
             task["playbook_config_version"] = self.playbook_config_version
             task["updated_at"] = self.simulation_time
             task["owner_task_state"] = None
+
+            if self._task_type(task) != TASK_TYPE_ISR_OBSERVE:
+                continue
 
             if self.active_response_task_id is None:
                 task["status"] = "electing"
@@ -1719,6 +1905,16 @@ class DroneSimulator:
             self.response_task_queue.append(task_id)
 
     def _start_return_to_patrol_locked(self) -> None:
+        if (
+            self.response_east_m is not None
+            and self.response_north_m is not None
+            and self.response_heading_deg is not None
+        ):
+            self.return_east_m = self.response_east_m
+            self.return_north_m = self.response_north_m
+            self.return_heading_deg = self.response_heading_deg
+            return
+
         latitude, longitude, heading = self._pose_at_locked()
         east_m, north_m = lat_lon_to_local_m(
             MAP_REFERENCE_LATITUDE,
@@ -2043,6 +2239,7 @@ class DroneSimulator:
 
         if observation.priority_evidence:
             self._ensure_response_task_locked(observation, object_map)
+            self._ensure_payload_request_for_priority_object_locked(object_map)
 
         return True
 
@@ -2551,7 +2748,7 @@ class DroneSimulator:
         if task is None:
             return "patrol"
 
-        if task.get("status") in {"transitioning", "orbiting"}:
+        if task.get("status") in {"transitioning", "orbiting", *PAYLOAD_EXECUTION_STATUSES}:
             return str(task["status"])
 
         return "patrol"
@@ -2559,7 +2756,7 @@ class DroneSimulator:
     def _assigned_objective_locked(self) -> str | None:
         task = self.response_tasks.get(self.active_response_task_id or "")
 
-        if task is None or task.get("status") not in {"transitioning", "orbiting"}:
+        if task is None or task.get("status") not in {"transitioning", "orbiting", *PAYLOAD_EXECUTION_STATUSES}:
             return None
 
         return str(task["signature_id"])
@@ -2569,17 +2766,57 @@ class DroneSimulator:
 
         return bool(
             task
+            and self._task_type(task) == TASK_TYPE_ISR_OBSERVE
             and task.get("assigned_drone_id") == self.drone_id
             and task.get("status") in {"transitioning", "orbiting"}
             and self.selected_playbook == PLAYBOOK_OBSERVE_ORBIT
             and int(task.get("playbook_config_version", self.playbook_config_version)) == self.playbook_config_version
         )
 
+    def _has_local_payload_control_locked(self) -> bool:
+        task = self.response_tasks.get(self.active_response_task_id or "")
+
+        return bool(
+            task
+            and self._task_type(task) == TASK_TYPE_PAYLOAD_DROP
+            and task.get("assigned_drone_id") == self.drone_id
+            and task.get("status") in PAYLOAD_EXECUTION_STATUSES
+        )
+
+    def _has_local_execution_control_locked(self) -> bool:
+        return self._has_local_response_control_locked() or self._has_local_payload_control_locked()
+
     def _clear_response_guidance_locked(self) -> None:
         self.response_east_m = None
         self.response_north_m = None
         self.response_heading_deg = None
         self.response_camera_yaw_deg = None
+
+    def _initialize_payload_response_control_locked(self, task: dict[str, object]) -> None:
+        task_id = str(task["task_id"])
+
+        if (
+            self.active_response_task_id == task_id
+            and self.response_east_m is not None
+            and self.response_north_m is not None
+            and self.response_heading_deg is not None
+            and self.response_camera_yaw_deg is not None
+        ):
+            return
+
+        latitude, longitude, heading = self._pose_at_locked()
+        response_east_m, response_north_m = lat_lon_to_local_m(
+            MAP_REFERENCE_LATITUDE,
+            MAP_REFERENCE_LONGITUDE,
+            latitude,
+            longitude,
+        )
+        self.active_response_task_id = task_id
+        self.response_east_m = response_east_m
+        self.response_north_m = response_north_m
+        self.response_heading_deg = heading
+        self.response_camera_yaw_deg = heading
+        task["payload_standoff_m"] = float(task.get("payload_standoff_m", self.payload_standoff_m))
 
     def _initialize_local_response_control_locked(self, task: dict[str, object]) -> None:
         task_id = str(task["task_id"])
@@ -2621,8 +2858,11 @@ class DroneSimulator:
         owner_drone_name: object,
     ) -> tuple[int, int, str]:
         precedence = {
-            "cancelled": 6,
-            "released": 5,
+            "cancelled": 8,
+            "released": 7,
+            PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS: 6,
+            PAYLOAD_APPROACHING_STATUS: 5,
+            PAYLOAD_WAITING_FOR_TRACK_STATUS: 4,
             "orbiting": 4,
             "transitioning": 3,
             "reported": 2,
@@ -2669,6 +2909,8 @@ class DroneSimulator:
             "claimant_drone_id": self.drone_id,
             "claimant_drone_name": self.name,
             "claimant_team_configuration": self.team_configuration.to_dict(),
+            "claimant_payload_reservations": dict(self.payload_reservations_by_task),
+            "claimant_available_payload_inventory": self._available_payload_inventory_locked(),
             "owner_drone_id": task.get("assigned_drone_id"),
             "owner_drone_name": task.get("assigned_drone_name"),
             "status": status,
@@ -2694,6 +2936,9 @@ class DroneSimulator:
                     "requested_payload_type": str(task.get("requested_payload_type", "")),
                     "requested_payload_quantity": int(task.get("requested_payload_quantity", 0) or 0),
                     "release_authorization_required": bool(task.get("release_authorization_required", True)),
+                    "reservation_state": str(task.get("reservation_state", "not_reserved")),
+                    "reserved_payload_quantity": int(task.get("reserved_payload_quantity", 0) or 0),
+                    "payload_standoff_m": float(task.get("payload_standoff_m", self.payload_standoff_m)),
                 },
             )
 
@@ -2754,7 +2999,7 @@ class DroneSimulator:
             if task.get("assigned_drone_id") != drone_id:
                 continue
 
-            if task.get("status") in {"transitioning", "orbiting", "assigned_remote"}:
+            if task.get("status") in {"transitioning", "orbiting", "assigned_remote", *PAYLOAD_EXECUTION_STATUSES}:
                 return True
 
         return False
@@ -2836,7 +3081,7 @@ class DroneSimulator:
             claim = self._task_claim_payload_locked(task)
             self.claims.setdefault(task_id, {})[self.drone_id] = claim
             self.outbound_claims.append(claim)
-        elif task_id not in self.response_task_queue and self._task_type(task) == TASK_TYPE_ISR_OBSERVE:
+        elif task_id not in self.response_task_queue:
             task["status"] = "queued"
             task["playbook_config_version"] = self.playbook_config_version
             task["updated_at"] = self.simulation_time
@@ -2867,6 +3112,9 @@ class DroneSimulator:
         if task_id != expected_task_id:
             return False
 
+        if task_id in self.cancelled_task_ids:
+            return False
+
         if "claimant_team_configuration" in payload:
             try:
                 validate_advertised_team_member(payload["claimant_team_configuration"])
@@ -2880,9 +3128,6 @@ class DroneSimulator:
         revision = int(payload.get("revision", 0))
 
         if task_id not in self.response_tasks:
-            if task_type == TASK_TYPE_PAYLOAD_DROP:
-                return False
-
             self.response_tasks[task_id] = self._new_response_task_locked(
                 contact_ref=contact_ref,
                 task_type=task_type,
@@ -2892,11 +3137,16 @@ class DroneSimulator:
                 estimated_latitude=latitude,
                 estimated_longitude=longitude,
                 last_observation_at=float(payload.get("updated_at", self.simulation_time)),
-                status="queued",
-                event="Peer claim received; local deterministic election joined if this node is eligible.",
+                status=PAYLOAD_REQUEST_REPORTED_STATUS if task_type == TASK_TYPE_PAYLOAD_DROP else "queued",
+                event="Peer task request received; local deterministic election joined if this node is eligible.",
+                requested_payload_type=str(payload.get("requested_payload_type", "")) if task_type == TASK_TYPE_PAYLOAD_DROP else None,
+                requested_payload_quantity=int(payload.get("requested_payload_quantity", 0) or 0) if task_type == TASK_TYPE_PAYLOAD_DROP else None,
             )
             self.response_tasks[task_id]["election_deadline"] = max(self.simulation_time + TASK_ELECTION_SECONDS, float(payload.get("election_deadline", self.simulation_time)))
             self.response_tasks[task_id]["assignment_epoch"] = int(payload.get("assignment_epoch", 0))
+
+            self.response_tasks[task_id]["requesting_drone_id"] = payload.get("requesting_drone_id", payload.get("claimant_drone_id"))
+            self.response_tasks[task_id]["requesting_drone_name"] = payload.get("requesting_drone_name", payload.get("claimant_drone_name"))
 
             if self.active_response_task_id is None and self._task_is_executable_by_this_node_locked(self.response_tasks[task_id]):
                 self.response_tasks[task_id]["status"] = "electing"
@@ -2912,10 +3162,45 @@ class DroneSimulator:
         if self._task_type(task) != task_type or self._task_contact_ref(task) != contact_ref:
             return False
 
-        if task_type == TASK_TYPE_PAYLOAD_DROP and payload_status not in {PAYLOAD_PENDING_STATUS, "cancelled"}:
-            return False
+        if task_type == TASK_TYPE_PAYLOAD_DROP:
+            requested_payload_type = str(payload.get("requested_payload_type", ""))
+            requested_payload_quantity = int(payload.get("requested_payload_quantity", 0) or 0)
+            if task_id in self.response_tasks and not self._payload_request_metadata_matches(self.response_tasks[task_id], requested_payload_type, requested_payload_quantity):
+                self.response_tasks[task_id]["metadata_conflict"] = True
+                self.response_tasks[task_id]["event"] = "Conflicting payload request metadata rejected; existing request was not overwritten."
+                return False
 
-        if payload_status in {"transitioning", "orbiting", "reported", "cancelled", "released"}:
+        if (
+            task_type == TASK_TYPE_PAYLOAD_DROP
+            and payload_status == PAYLOAD_REQUEST_REPORTED_STATUS
+            and payload.get("owner_drone_id") is None
+        ):
+            incoming_epoch = int(payload.get("assignment_epoch", task.get("assignment_epoch", 0)))
+            current_epoch = int(task.get("assignment_epoch", 0))
+            incoming_config_version = int(payload.get("playbook_config_version", task.get("playbook_config_version", 0)))
+            current_config_version = int(task.get("playbook_config_version", 0))
+            current_revision = int(task.get("revision", 0))
+
+            if incoming_epoch < current_epoch:
+                return False
+
+            if revision < current_revision:
+                return False
+
+            if incoming_config_version < current_config_version:
+                return False
+
+            if task.get("status") in {"cancelled", "assigned_remote", *PAYLOAD_EXECUTION_STATUSES}:
+                return False
+
+            task["assignment_epoch"] = max(current_epoch, incoming_epoch)
+            task["playbook_config_version"] = max(current_config_version, incoming_config_version)
+            task["updated_at"] = self.simulation_time
+            task["event"] = "Peer payload-drop request received; local election remains eligible if this node can execute it."
+            self._make_task_allocatable_locked(task_id, task)
+            return True
+
+        if payload_status in {"transitioning", "orbiting", "reported", "cancelled", "released", *PAYLOAD_EXECUTION_STATUSES}:
             current_revision = int(task.get("revision", 0))
             incoming_epoch = int(payload.get("assignment_epoch", task.get("assignment_epoch", 0)))
             current_epoch = int(task.get("assignment_epoch", 0))
@@ -2959,7 +3244,7 @@ class DroneSimulator:
                 if current_owner_int not in {payload_owner_int, claimant_drone_id}:
                     return False
 
-            if payload_status in {"transitioning", "orbiting"} and owner_drone_id is not None:
+            if payload_status in {"transitioning", "orbiting", *PAYLOAD_EXECUTION_STATUSES} and owner_drone_id is not None:
                 try:
                     incoming_owner_int = int(owner_drone_id)
                 except (TypeError, ValueError):
@@ -2988,6 +3273,7 @@ class DroneSimulator:
                 task["previous_assigned_drone_name"] = task.get("assigned_drone_name")
                 task["assigned_drone_id"] = None
                 task["assigned_drone_name"] = None
+                self._release_payload_reservation_locked(task)
                 task["status"] = "cancelled"
                 self.cancelled_task_ids.add(task_id)
 
@@ -2998,6 +3284,7 @@ class DroneSimulator:
                     self.active_response_task_id = None
                     self._clear_response_guidance_locked()
             elif payload_status in {"released", "reported"}:
+                self._release_payload_reservation_locked(task)
                 self._release_current_assignment_locked(task, payload_status)
 
                 if self.active_response_task_id == task_id:
@@ -3009,7 +3296,11 @@ class DroneSimulator:
                 else:
                     self._promote_next_queued_task_locked()
             elif int(owner_drone_id) == self.drone_id:
-                self._initialize_local_response_control_locked(task)
+                if self._task_type(task) == TASK_TYPE_PAYLOAD_DROP:
+                    self._initialize_payload_response_control_locked(task)
+                    self._reserve_payload_inventory_locked(task)
+                else:
+                    self._initialize_local_response_control_locked(task)
                 task["status"] = payload_status
             else:
                 task["status"] = "assigned_remote"
@@ -3146,7 +3437,21 @@ class DroneSimulator:
         task["assignment_epoch"] = int(task.get("assignment_epoch", 0))
         task["updated_at"] = self.simulation_time
 
-        if self.selected_playbook == PLAYBOOK_REPORT_CONTINUE:
+        if self._task_type(task) == TASK_TYPE_PAYLOAD_DROP:
+            if assigned_drone_id == self.drone_id:
+                self._initialize_payload_response_control_locked(task)
+                self._reserve_payload_inventory_locked(task)
+                task["status"] = PAYLOAD_APPROACHING_STATUS
+                task["owner_task_state"] = PAYLOAD_APPROACHING_STATUS
+                task["event"] = "Payload drone won deterministic election and is approaching the local shared contact estimate."
+                self.outbound_claims.append(self._task_claim_payload_locked(task, PAYLOAD_APPROACHING_STATUS))
+            else:
+                task["status"] = "assigned_remote"
+                task["owner_task_state"] = PAYLOAD_APPROACHING_STATUS
+                task["event"] = "Another payload-capable drone won deterministic election."
+                self.active_response_task_id = None
+                self._promote_next_queued_task_locked()
+        elif self.selected_playbook == PLAYBOOK_REPORT_CONTINUE:
             task["status"] = "reported"
             task["playbook_config_version"] = self.playbook_config_version
             task["event"] = "Priority objective reported; all drones continue patrol."
@@ -3177,7 +3482,6 @@ class DroneSimulator:
             for task_id in self.response_task_queue
             if self.response_tasks.get(task_id, {}).get("status") == "queued"
             and str(self.response_tasks.get(task_id, {}).get("task_id")) not in self.cancelled_task_ids
-            and self._task_type(self.response_tasks.get(task_id, {})) == TASK_TYPE_ISR_OBSERVE
             and self._task_is_executable_by_this_node_locked(self.response_tasks.get(task_id, {}), task_id)
         ]
 
@@ -3195,6 +3499,107 @@ class DroneSimulator:
         claim = self._task_claim_payload_locked(task)
         self.claims.setdefault(next_task_id, {})[self.drone_id] = claim
         self.outbound_claims.append(claim)
+
+    def _contact_estimate_for_task_locked(self, task: dict[str, object]) -> dict[str, object] | None:
+        contact_ref = self._task_contact_ref(task)
+
+        for object_map in self.objects.values():
+            if str(object_map.get("priority_signature") or "") != contact_ref:
+                continue
+
+            if object_map.get("tracking_model") == "constant_velocity":
+                self._refresh_moving_track_payload_locked(object_map)
+                if object_map.get("track_status") == "lost":
+                    return None
+            else:
+                self._refresh_fused_object_locked(object_map)
+
+            if bool(object_map.get("stale", False)):
+                return None
+
+            return object_map
+
+        return None
+
+    def _update_payload_guidance_locked(self, elapsed_seconds: float) -> None:
+        if not self._has_local_payload_control_locked() or elapsed_seconds <= 0.0:
+            return
+
+        task = self.response_tasks[self.active_response_task_id or ""]
+        estimate = self._contact_estimate_for_task_locked(task)
+
+        if estimate is None:
+            previous_status = str(task.get("status", ""))
+            last_broadcast_at = float(task.get("last_state_broadcast_at", -math.inf) or -math.inf)
+            should_broadcast = (
+                previous_status != PAYLOAD_WAITING_FOR_TRACK_STATUS
+                or self.simulation_time - last_broadcast_at >= PAYLOAD_STATE_HEARTBEAT_SECONDS
+            )
+            task["status"] = PAYLOAD_WAITING_FOR_TRACK_STATUS
+            task["owner_task_state"] = PAYLOAD_WAITING_FOR_TRACK_STATUS
+            task["event"] = "Payload approach paused: no usable local shared contact estimate is available."
+            task["updated_at"] = self.simulation_time
+
+            if should_broadcast:
+                self.outbound_claims.append(self._task_claim_payload_locked(task, PAYLOAD_WAITING_FOR_TRACK_STATUS))
+                task["last_state_broadcast_at"] = self.simulation_time
+
+            return
+
+        assert self.response_east_m is not None
+        assert self.response_north_m is not None
+        assert self.response_heading_deg is not None
+
+        target_east_m = clamp(float(estimate["east_m"]), -SCENARIO_BOUND_EAST_M, SCENARIO_BOUND_EAST_M)
+        target_north_m = clamp(float(estimate["north_m"]), -SCENARIO_BOUND_NORTH_M, SCENARIO_BOUND_NORTH_M)
+        delta_east = target_east_m - self.response_east_m
+        delta_north = target_north_m - self.response_north_m
+        distance = math.hypot(delta_east, delta_north)
+        stand_off_m = float(task.get("payload_standoff_m", self.payload_standoff_m))
+
+        if distance <= stand_off_m:
+            self.response_camera_yaw_deg = math.degrees(math.atan2(delta_east, delta_north)) % 360.0 if distance > 0.0 else self.response_heading_deg
+            if task["status"] != PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS:
+                task["status"] = PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS
+                task["owner_task_state"] = PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS
+                task["event"] = "Payload drone is holding at stand-off awaiting local acquisition; no release or delivery is claimed."
+                self.outbound_claims.append(self._task_claim_payload_locked(task, PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS))
+                task["last_state_broadcast_at"] = self.simulation_time
+            task["updated_at"] = self.simulation_time
+            task["estimated_east_m"] = target_east_m
+            task["estimated_north_m"] = target_north_m
+            task["estimated_latitude"] = float(estimate["latitude"])
+            task["estimated_longitude"] = float(estimate["longitude"])
+            return
+
+        max_distance = MAX_RESPONSE_SPEED_MPS * elapsed_seconds
+        travel_distance = max(0.0, min(max_distance, distance - stand_off_m))
+        if travel_distance > 0.0:
+            scale = travel_distance / distance
+            self.response_east_m += delta_east * scale
+            self.response_north_m += delta_north * scale
+
+        desired_heading = math.degrees(math.atan2(delta_east, delta_north)) % 360.0
+        self.response_heading_deg = move_angle_toward(
+            self.response_heading_deg,
+            desired_heading,
+            MAX_RESPONSE_TURN_RATE_DEG_PER_SECOND * elapsed_seconds,
+        )
+        self.response_camera_yaw_deg = desired_heading
+
+        if task["status"] != PAYLOAD_APPROACHING_STATUS:
+            task["status"] = PAYLOAD_APPROACHING_STATUS
+            task["owner_task_state"] = PAYLOAD_APPROACHING_STATUS
+            task["event"] = "Payload approach resumed using a valid local shared contact estimate."
+            self.outbound_claims.append(self._task_claim_payload_locked(task, PAYLOAD_APPROACHING_STATUS))
+            task["last_state_broadcast_at"] = self.simulation_time
+
+        task["updated_at"] = self.simulation_time
+        task["estimated_east_m"] = target_east_m
+        task["estimated_north_m"] = target_north_m
+        task["estimated_latitude"] = float(estimate["latitude"])
+        task["estimated_longitude"] = float(estimate["longitude"])
+        task["range_to_contact_estimate_m"] = distance
 
     def _update_response_guidance_locked(self, elapsed_seconds: float) -> None:
         if not self._has_local_response_control_locked() or elapsed_seconds <= 0.0:
@@ -3249,7 +3654,7 @@ class DroneSimulator:
             or self.return_east_m is None
             or self.return_north_m is None
             or self.return_heading_deg is None
-            or self._has_local_response_control_locked()
+            or self._has_local_execution_control_locked()
         ):
             return
 
@@ -3302,9 +3707,11 @@ class DroneSimulator:
                 if str(task["task_id"]) in self.response_task_queue:
                     self.response_task_queue.remove(str(task["task_id"]))
 
+                self._release_payload_reservation_locked(task)
                 self.outbound_claims.append(self._task_claim_payload_locked(task, "cancelled"))
 
             if self.active_response_task_id == target_task_id:
+                self._start_return_to_patrol_locked()
                 self.active_response_task_id = None
                 self._clear_response_guidance_locked()
 
@@ -3413,6 +3820,14 @@ class DroneRequestHandler(http.server.BaseHTTPRequestHandler):
                     str(payload.get("scenario_run_id", new_run_id(self.simulator.scenario_seed))),
                 )
 
+            if "payload_requests_enabled" in payload or "payload_type" in payload or "payload_quantity" in payload or "payload_standoff_m" in payload:
+                self.simulator.configure_payload_requests(
+                    bool(payload["payload_requests_enabled"]) if "payload_requests_enabled" in payload else None,
+                    str(payload["payload_type"]) if "payload_type" in payload else None,
+                    int(payload["payload_quantity"]) if "payload_quantity" in payload else None,
+                    float(payload["payload_standoff_m"]) if "payload_standoff_m" in payload else None,
+                )
+
             if "paused" in payload:
                 self.simulator.set_paused(bool(payload["paused"]))
 
@@ -3492,6 +3907,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--next-observer-id", type=int, choices=sorted(DRONE_PROFILES), default=DEFAULT_NEXT_OBSERVER_ID)
     parser.add_argument("--scenario-run-id", default=None)
     parser.add_argument("--team-config", default=None)
+    parser.add_argument("--enable-payload-requests", action="store_true")
+    parser.add_argument("--payload-type", default=DEFAULT_PAYLOAD_TYPE)
+    parser.add_argument("--payload-quantity", type=int, default=DEFAULT_PAYLOAD_QUANTITY)
+    parser.add_argument("--payload-standoff-m", type=float, default=DEFAULT_PAYLOAD_STANDOFF_M)
     return parser.parse_args()
 
 
@@ -3517,6 +3936,10 @@ def main() -> int:
         args.next_observer_id,
         args.scenario_run_id,
         dict(team_config),
+        args.enable_payload_requests,
+        args.payload_type,
+        args.payload_quantity,
+        args.payload_standoff_m,
     )
 
     stop_event = threading.Event()

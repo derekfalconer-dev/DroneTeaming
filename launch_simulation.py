@@ -30,6 +30,9 @@ SCENARIO_NAME = "Seeded noisy overlapping moving-search patrol"
 DEFAULT_SCENARIO_SEED = 20261106
 RANDOM_PRIORITY_OBJECT_COUNT = 0
 DEFAULT_PLAYBOOK = "report_continue"
+DEFAULT_PAYLOAD_TYPE = "rescue_kit"
+DEFAULT_PAYLOAD_QUANTITY = 1
+DEFAULT_PAYLOAD_STANDOFF_M = 45.0
 DEFAULT_SCENARIO_ID = "seeded_stationary_patrol"
 MOVING_HANDOFF_SCENARIO_ID = "moving_person_handoff"
 DEFAULT_INITIAL_OBSERVER_ID = 1
@@ -689,6 +692,10 @@ DASHBOARD_HTML = r"""<!doctype html>
       responseTasks: [],
       responseQueueDepth: 0,
       taskSnapshotsByDrone: new Map(),
+      payloadRequestsEnabled: false,
+      requestedPayloadType: "rescue_kit",
+      requestedPayloadQuantity: 1,
+      payloadStandoffM: 45,
       droneAvailability: new Map(),
       currentRunKey: null,
       orbitRadiusM: 0,
@@ -855,6 +862,10 @@ DASHBOARD_HTML = r"""<!doctype html>
       state.priorityObjectCount = state.truth.priority_object_count || 0;
       state.priorityDiscoveredCount = state.truth.priority_discovered_count || 0;
       state.orbitRadiusM = state.truth.orbit_radius_m || 0;
+      state.payloadRequestsEnabled = Boolean(state.truth.payload_requests_enabled);
+      state.requestedPayloadType = state.truth.requested_payload_type || state.requestedPayloadType;
+      state.requestedPayloadQuantity = Number(state.truth.requested_payload_quantity || state.requestedPayloadQuantity);
+      state.payloadStandoffM = Number(state.truth.payload_standoff_m || state.payloadStandoffM);
 
       const runKey = [
         state.scenarioId,
@@ -1952,6 +1963,10 @@ DASHBOARD_HTML = r"""<!doctype html>
         return null;
       }
 
+      if (normalized.includes("payload") || normalized.includes("acquisition")) {
+        return normalized;
+      }
+
       if (normalized.includes("orbit")) {
         return "orbiting";
       }
@@ -2190,11 +2205,15 @@ DASHBOARD_HTML = r"""<!doctype html>
           const conflicts = activeOwnerConflicts(reports, authoritativeReport);
 
           let selectedReport = authoritativeReport;
-          let taskState = taskTypeFor(assignedReport.task) === "payload_drop" ? "pending workflow — no execution in this increment" : "Assigned — activity unknown";
+          let taskState = "Assigned — activity unknown";
           let sourceLabel = ownerReport ? `owner ${snapshotTaskReportAge(ownerReport.snapshot)}` : "owner report unavailable";
+          const statusText = String(assignedReport.task.status || "queued").toLowerCase();
+          const dormantPayload = taskTypeFor(assignedReport.task) === "payload_drop"
+            && ["pending_workflow", "reported", "queued"].includes(statusText)
+            && (ownerCleared || assignedDroneId === null);
 
-          if (taskTypeFor(assignedReport.task) === "payload_drop") {
-            taskState = "pending workflow — no execution in this increment";
+          if (dormantPayload) {
+            taskState = "dormant";
             sourceLabel = "payload workflow dormant";
           } else if (ownerCleared || assignedDroneId === null) {
             taskState = normalizedExecutionState(assignedReport.task.status) || String(assignedReport.task.status || "queued");
@@ -2230,6 +2249,9 @@ DASHBOARD_HTML = r"""<!doctype html>
             assignedDroneName: (assignedDroneId === null || freshOwnerInactiveReport) ? "Unassigned" : assignedDroneNameFor(assignedReport.task),
             taskState,
             observationAge: observationAgeFor(selectedReport.task, selectedReport.snapshot),
+            payloadRequirement: taskTypeFor(assignedReport.task) === "payload_drop"
+              ? `${assignedReport.task.requested_payload_type || "payload"} × ${Number(assignedReport.task.requested_payload_quantity || 0)} · ${assignedReport.task.reservation_state || "not reserved"}`
+              : "—",
             sourceLabel,
           };
         });
@@ -2617,13 +2639,14 @@ DASHBOARD_HTML = r"""<!doctype html>
       details.innerHTML = `
         <div>${droneModes}</div>
         <table class="assignment-table">
-          <thead><tr><th>Task</th><th>Type</th><th>Assigned drone</th><th>Task state</th><th>Last observation age</th><th>Status report</th></tr></thead>
+          <thead><tr><th>Task</th><th>Type</th><th>Assigned drone</th><th>Task state</th><th>Payload / reservation</th><th>Last observation age</th><th>Status report</th></tr></thead>
           <tbody>
             ${rows.map((row) => `<tr>
               <td title="${escapeHtml(row.debugTitle)}">${escapeHtml(row.displayName)}</td>
               <td>${escapeHtml(row.taskType)}</td>
               <td>${escapeHtml(row.assignedDroneName)}</td>
               <td>${escapeHtml(row.taskState)}</td>
+              <td>${escapeHtml(row.payloadRequirement)}</td>
               <td>${escapeHtml(row.observationAge)}</td>
               <td>${escapeHtml(row.sourceLabel)}</td>
             </tr>`).join("")}
@@ -2801,7 +2824,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       }).join(" · ");
       document.getElementById("team-config-state").textContent = teamConfigSummary;
       document.getElementById("control-state").textContent = `${state.sharingEnabled ? "Sharing on" : "Sharing off"} · ${state.paused ? "paused" : "running"}`;
-      document.getElementById("scenario-state").textContent = `${state.scenarioName} · seed ${state.scenarioSeed} · run ${state.scenarioRunId || "—"} · priority ${state.priorityObjectCount} · playbook ${state.selectedPlaybook} · build ${state.appBuild}`;
+      document.getElementById("scenario-state").textContent = `${state.scenarioName} · seed ${state.scenarioSeed} · run ${state.scenarioRunId || "—"} · priority ${state.priorityObjectCount} · playbook ${state.selectedPlaybook} · payload requests ${state.payloadRequestsEnabled ? `${state.requestedPayloadType}×${state.requestedPayloadQuantity}` : "off"} · build ${state.appBuild}`;
       document.getElementById("task-state").textContent = `${taskSummary.orbiting} orbiting · ${taskSummary.transitioning} transitioning · ${taskSummary.searching} searching · ${taskSummary.queued} queued`;
       document.getElementById("playbook-config-state").textContent = pendingConfig && !applied
         ? `Requested ${pendingConfig.playbook} v${pendingConfig.version} pending · applied ${state.selectedPlaybook} · ${acknowledgedVersions.join(" · ")}`
@@ -3245,6 +3268,13 @@ class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Launch drone simulator processes and open a browser dashboard.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Enabled payload example with matching inventory:\n"
+            "  python3 launch_simulation.py --team-config team_config_payload_demo.json "
+            "--enable-payload-requests --payload-type rescue_kit --payload-quantity 1\n\n"
+            "The requested payload type must exist in at least one payload-capable drone's inventory."
+        ),
     )
     parser.add_argument("--dashboard-host", default=DEFAULT_DASHBOARD_HOST)
     parser.add_argument("--dashboard-port", type=int, default=DEFAULT_DASHBOARD_PORT)
@@ -3283,6 +3313,14 @@ def parse_args() -> argparse.Namespace:
         help="Optional JSON team configuration keyed by drone ID.",
     )
     parser.add_argument(
+        "--enable-payload-requests",
+        action="store_true",
+        help="Allow ISR drones to publish payload-drop requests for accepted priority contacts.",
+    )
+    parser.add_argument("--payload-type", default=DEFAULT_PAYLOAD_TYPE)
+    parser.add_argument("--payload-quantity", type=int, default=DEFAULT_PAYLOAD_QUANTITY)
+    parser.add_argument("--payload-standoff-m", type=float, default=DEFAULT_PAYLOAD_STANDOFF_M)
+    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="Start the processes without opening a browser.",
@@ -3316,6 +3354,10 @@ def start_drone_processes(
     next_observer_id: int,
     scenario_run_id: str,
     team_config_path: Path | None = None,
+    payload_requests_enabled: bool = False,
+    payload_type: str = DEFAULT_PAYLOAD_TYPE,
+    payload_quantity: int = DEFAULT_PAYLOAD_QUANTITY,
+    payload_standoff_m: float = DEFAULT_PAYLOAD_STANDOFF_M,
 ) -> list[subprocess.Popen[str]]:
     drone_script = Path(__file__).with_name("simulated_drone.py")
     processes: list[subprocess.Popen[str]] = []
@@ -3353,7 +3395,16 @@ def start_drone_processes(
             str(next_observer_id),
             "--scenario-run-id",
             scenario_run_id,
+            "--payload-type",
+            payload_type,
+            "--payload-quantity",
+            str(max(1, payload_quantity)),
+            "--payload-standoff-m",
+            str(max(1.0, payload_standoff_m)),
         ]
+
+        if payload_requests_enabled:
+            command.append("--enable-payload-requests")
 
         if team_config_path is not None:
             command.extend(["--team-config", str(team_config_path)])
@@ -3447,6 +3498,10 @@ def main() -> int:
         next_observer_id,
         scenario_run_id,
         team_config_path,
+        args.enable_payload_requests,
+        args.payload_type,
+        args.payload_quantity,
+        args.payload_standoff_m,
     )
 
     try:

@@ -60,6 +60,86 @@ def fetch_json(url: str, method: str = "GET", payload: dict[str, object] | None 
         return json.loads(response.read().decode("utf-8"))
 
 
+def process_output(process: subprocess.Popen[str]) -> tuple[str, str]:
+    if process.poll() is None:
+        return "<still running>", "<still running>"
+
+    try:
+        stdout, stderr = process.communicate(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        return "<stdout unavailable>", "<stderr unavailable>"
+
+    return stdout or "", stderr or ""
+
+
+def format_process_startup_failure(commands: list[list[str]], processes: list[subprocess.Popen[str]]) -> str:
+    lines = ["Drone process startup failed."]
+
+    for command, process in zip(commands, processes, strict=False):
+        stdout, stderr = process_output(process)
+        lines.extend(
+            [
+                f"command: {subprocess.list2cmdline(command)}",
+                f"exit_code: {process.poll()}",
+                f"stdout: {stdout.strip() or '<empty>'}",
+                f"stderr: {stderr.strip() or '<empty>'}",
+            ],
+        )
+
+    return "\n".join(lines)
+
+
+def close_process_pipes(processes: list[subprocess.Popen[str]]) -> None:
+    for process in processes:
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None and not pipe.closed:
+                pipe.close()
+
+
+def wait_for_successful_peer_send(port: int, timeout_seconds: float = 5.0) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_seconds
+    last_payload: dict[str, object] = {}
+
+    while time.monotonic() < deadline:
+        last_payload = fetch_json(f"http://{HOST}:{port}/network")
+        peers = last_payload.get("peer_connection_state", [])
+        if (
+            last_payload.get("payload_bytes_sent", 0) > 0
+            and any(peer.get("last_rtt_ms") is not None for peer in peers)  # type: ignore[union-attr]
+        ):
+            return last_payload
+
+        time.sleep(0.1)
+
+    raise AssertionError(f"Timed out waiting for peer send accounting on port {port}: {last_payload}")
+
+
+def wait_for_stable_peer_byte_counters(port: int, timeout_seconds: float = 5.0) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_seconds
+    previous: tuple[int, int] | None = None
+    stable_since: float | None = None
+    last_payload: dict[str, object] = {}
+
+    while time.monotonic() < deadline:
+        last_payload = fetch_json(f"http://{HOST}:{port}/network")
+        current = (
+            int(last_payload.get("payload_bytes_sent", 0)),
+            int(last_payload.get("payload_bytes_received", 0)),
+        )
+
+        if current == previous:
+            stable_since = stable_since or time.monotonic()
+            if time.monotonic() - stable_since >= 0.5:
+                return last_payload
+        else:
+            previous = current
+            stable_since = None
+
+        time.sleep(0.1)
+
+    raise AssertionError(f"Timed out waiting for stable peer byte counters on port {port}: {last_payload}")
+
+
 def synthetic_observation(
     observation_id: str,
     source_drone_id: int = 1,
@@ -153,34 +233,38 @@ class ObservationNetworkTraceTest(unittest.TestCase):
         ports = [free_port(), free_port(), free_port()]
         script = Path(__file__).with_name("simulated_drone.py")
         processes: list[subprocess.Popen[str]] = []
+        commands: list[list[str]] = []
 
         try:
             for drone_id, name, port in zip((1, 2, 3), ("Red", "Blue", "Green"), ports, strict=True):
                 peers = [f"http://{HOST}:{peer_port}" for peer_port in ports if peer_port != port]
+                command = [
+                    sys.executable,
+                    str(script),
+                    "--id",
+                    str(drone_id),
+                    "--name",
+                    name,
+                    "--host",
+                    HOST,
+                    "--port",
+                    str(port),
+                    "--peers",
+                    *peers,
+                ]
+                commands.append(command)
                 processes.append(
                     subprocess.Popen(
-                        [
-                            sys.executable,
-                            str(script),
-                            "--id",
-                            str(drone_id),
-                            "--name",
-                            name,
-                            "--host",
-                            HOST,
-                            "--port",
-                            str(port),
-                            "--peers",
-                            *peers,
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
                         text=True,
                     ),
                 )
 
-            for port in ports:
-                self.assertTrue(wait_for_port(port), f"drone on port {port} did not start")
+            for index, port in enumerate(ports):
+                if not wait_for_port(port) or processes[index].poll() is not None:
+                    self.fail(format_process_startup_failure(commands, processes))
 
             for port in ports:
                 fetch_json(f"http://{HOST}:{port}/control", "POST", {"sharing_enabled": True})
@@ -216,22 +300,24 @@ class ObservationNetworkTraceTest(unittest.TestCase):
             self.assertTrue(origin_trace["record"]["originated_locally"])
             origin_port = ports[int(origin_trace["drone_id"]) - 1]
 
+            transmitted_network = wait_for_successful_peer_send(origin_port)
+            self.assertGreaterEqual(transmitted_network["observation_messages_sent"], 1)
+
             for port in ports:
                 fetch_json(f"http://{HOST}:{port}/control", "POST", {"paused": True})
 
-            before = fetch_json(f"http://{HOST}:{origin_port}/network")
+            before = wait_for_stable_peer_byte_counters(origin_port)
             fetch_json(f"http://{HOST}:{origin_port}/status")
             fetch_json(f"http://{HOST}:{origin_port}/objects")
             fetch_json(f"http://{HOST}:{origin_port}/network")
-            after = fetch_json(f"http://{HOST}:{origin_port}/network")
+            after = wait_for_stable_peer_byte_counters(origin_port)
 
             self.assertGreaterEqual(after["observation_messages_sent"], 1)
             self.assertIn("send_failures", after)
             self.assertEqual(before["payload_bytes_sent"], after["payload_bytes_sent"])
             self.assertEqual(before["payload_bytes_received"], after["payload_bytes_received"])
 
-            time.sleep(0.2)
-            paused_network = fetch_json(f"http://{HOST}:{ports[0]}/network")
+            paused_network = fetch_json(f"http://{HOST}:{origin_port}/network")
             self.assertEqual(paused_network["wall_time_source"], "time.monotonic")
             self.assertTrue(
                 any(
@@ -251,6 +337,8 @@ class ObservationNetworkTraceTest(unittest.TestCase):
             for process in processes:
                 if process.poll() is None:
                     process.kill()
+
+            close_process_pipes(processes)
 
 
 if __name__ == "__main__":
