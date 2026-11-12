@@ -8,6 +8,7 @@ import json
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import urllib.request
@@ -143,6 +144,37 @@ class LaunchSimulationPathTest(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
 
+    def control_ack_failures(
+        self,
+        expected: dict[str, object],
+        payloads: list[dict[str, object]],
+    ) -> list[str]:
+        failures = []
+
+        for index, payload in enumerate(payloads):
+            node_failures = []
+            if payload["scenario_seed"] != expected["scenario_seed"]:
+                node_failures.append(f"seed {payload['scenario_seed']}")
+            if payload["scenario_id"] != expected["scenario_id"]:
+                node_failures.append(f"scenario {payload['scenario_id']}")
+            if payload["scenario_run_id"] != expected["scenario_run_id"]:
+                node_failures.append(f"run {payload['scenario_run_id']}")
+            if payload["initial_observer_id"] != expected["initial_observer_id"]:
+                node_failures.append(f"initial observer {payload['initial_observer_id']}")
+            if payload["next_observer_id"] != expected["next_observer_id"]:
+                node_failures.append(f"next observer {payload['next_observer_id']}")
+            if payload["selected_playbook"] != expected["selected_playbook"]:
+                node_failures.append(f"playbook {payload['selected_playbook']}")
+            if payload["paused"] != expected["paused"]:
+                node_failures.append(f"paused {payload['paused']}")
+            if payload["sharing_enabled"] != expected["sharing_enabled"]:
+                node_failures.append(f"sharing {payload['sharing_enabled']}")
+
+            if node_failures:
+                failures.append(f"{['Red', 'Blue', 'Green'][index]}: {', '.join(node_failures)}")
+
+        return failures
+
     def wait_for_control_ack(
         self,
         expected: dict[str, object],
@@ -150,29 +182,154 @@ class LaunchSimulationPathTest(unittest.TestCase):
     ) -> list[dict[str, object]]:
         deadline = time.monotonic() + timeout_seconds
         last_payloads: list[dict[str, object]] = []
+        failures: list[str] = []
 
         while time.monotonic() < deadline:
             last_payloads = [fetch_json(f"{url}/control") for url in self.urls]
-            failures = []
+            failures = self.control_ack_failures(expected, last_payloads)
 
-            for payload in last_payloads:
-                failures.extend([
-                    payload["scenario_seed"] != expected["scenario_seed"],
-                    payload["scenario_id"] != expected["scenario_id"],
-                    payload["scenario_run_id"] != expected["scenario_run_id"],
-                    payload["initial_observer_id"] != expected["initial_observer_id"],
-                    payload["next_observer_id"] != expected["next_observer_id"],
-                    payload["selected_playbook"] != expected["selected_playbook"],
-                    payload["paused"] != expected["paused"],
-                    payload["sharing_enabled"] != expected["sharing_enabled"],
-                ])
-
-            if not any(failures):
+            if not failures:
                 return last_payloads
 
             time.sleep(0.2)
 
-        raise AssertionError(f"Nodes did not acknowledge expected control state; last_payloads={last_payloads!r}")
+        raise AssertionError(
+            f"Nodes did not acknowledge expected control state; failures={failures!r}; "
+            f"last_payloads={last_payloads!r}",
+        )
+
+    def test_team_config_endpoint_and_control_ack_apply_actual_capabilities_and_inventory(self) -> None:
+        team_configuration = {
+            "1": {
+                "role": "isr",
+                "capabilities": ["atr_observe", "isr_observe"],
+                "available": True,
+                "payload_inventory": {},
+                "camera_mount": "steerable",
+            },
+            "2": {
+                "role": "payload",
+                "capabilities": ["payload_drop"],
+                "available": True,
+                "payload_inventory": {"water": 4, "medical_supplies": 2},
+                "camera_mount": "fixed",
+            },
+            "3": {
+                "role": "isr",
+                "capabilities": ["atr_observe", "isr_observe"],
+                "available": True,
+                "payload_inventory": {},
+                "camera_mount": "steerable",
+            },
+        }
+        saved = fetch_json(
+            f"http://{HOST}:{self.dashboard_port}/team-config",
+            method="POST",
+            payload=team_configuration,
+        )
+
+        self.assertTrue(saved["saved"])
+        self.assertEqual(team_configuration, saved["team_configuration"])
+
+        payload = {
+            "restart_scenario": True,
+            "scenario_seed": DEFAULT_SCENARIO_SEED,
+            "priority_count": 0,
+            "playbook": PLAYBOOK_REPORT_CONTINUE,
+            "scenario": DEFAULT_SCENARIO_ID,
+            "initial_observer_id": 1,
+            "next_observer_id": 2,
+            "scenario_run_id": "integration-team-config-ack",
+            "paused": True,
+            "sharing_enabled": True,
+            "team_configuration": team_configuration,
+        }
+        for url in self.urls:
+            fetch_json(f"{url}/control", method="POST", payload=payload)
+
+        self.wait_for_control_ack({
+            "scenario_seed": DEFAULT_SCENARIO_SEED,
+            "scenario_id": DEFAULT_SCENARIO_ID,
+            "scenario_run_id": "integration-team-config-ack",
+            "initial_observer_id": 1,
+            "next_observer_id": 2,
+            "selected_playbook": PLAYBOOK_REPORT_CONTINUE,
+            "paused": True,
+            "sharing_enabled": True,
+        })
+
+        blue_status = fetch_json(f"{self.urls[1]}/status")
+        self.assertEqual("payload", blue_status["team_configuration"]["role"])
+        self.assertEqual(["payload_drop"], blue_status["team_configuration"]["capabilities"])
+        self.assertEqual({"water": 4, "medical_supplies": 2}, blue_status["team_configuration"]["payload_inventory"])
+
+    def test_start_restart_seed_contract_and_mismatch_diagnostics(self) -> None:
+        initial_control = fetch_json(f"{self.urls[0]}/control")
+        applied_seed = initial_control["scenario_seed"]
+        self.assertIsInstance(applied_seed, int)
+
+        start_payload = {
+            "restart_scenario": True,
+            "scenario_seed": applied_seed,
+            "priority_count": 0,
+            "playbook": PLAYBOOK_REPORT_CONTINUE,
+            "scenario": DEFAULT_SCENARIO_ID,
+            "initial_observer_id": 1,
+            "next_observer_id": 2,
+            "scenario_run_id": "integration-seeded-start",
+            "paused": False,
+            "sharing_enabled": True,
+        }
+        for url in self.urls:
+            fetch_json(f"{url}/control", method="POST", payload=start_payload)
+
+        self.wait_for_control_ack({
+            "scenario_seed": applied_seed,
+            "scenario_id": DEFAULT_SCENARIO_ID,
+            "scenario_run_id": "integration-seeded-start",
+            "initial_observer_id": 1,
+            "next_observer_id": 2,
+            "selected_playbook": PLAYBOOK_REPORT_CONTINUE,
+            "paused": False,
+            "sharing_enabled": True,
+        })
+
+        restart_payload = {
+            "restart_scenario": True,
+            "scenario_run_id": "integration-seeded-restart",
+            "paused": True,
+            "sharing_enabled": True,
+        }
+        for url in self.urls:
+            fetch_json(f"{url}/control", method="POST", payload=restart_payload)
+
+        self.wait_for_control_ack({
+            "scenario_seed": applied_seed,
+            "scenario_id": DEFAULT_SCENARIO_ID,
+            "scenario_run_id": "integration-seeded-restart",
+            "initial_observer_id": 1,
+            "next_observer_id": 2,
+            "selected_playbook": PLAYBOOK_REPORT_CONTINUE,
+            "paused": True,
+            "sharing_enabled": True,
+        })
+
+        mismatch_payloads = [fetch_json(f"{url}/control") for url in self.urls]
+        failures = self.control_ack_failures(
+            {
+                "scenario_seed": applied_seed + 1,
+                "scenario_id": DEFAULT_SCENARIO_ID,
+                "scenario_run_id": "integration-seeded-restart",
+                "initial_observer_id": 1,
+                "next_observer_id": 2,
+                "selected_playbook": PLAYBOOK_REPORT_CONTINUE,
+                "paused": True,
+                "sharing_enabled": True,
+            },
+            mismatch_payloads,
+        )
+        self.assertTrue(failures)
+        self.assertTrue(any("Red: seed" in failure for failure in failures), failures)
 
     def test_handoff_demo_configuration_acknowledges_on_all_processes_and_restart_preserves_it(self) -> None:
         dashboard_request = urllib.request.Request(f"http://{HOST}:{self.dashboard_port}/")
@@ -252,7 +409,9 @@ class LaunchSimulationPathTest(unittest.TestCase):
             self.assertEqual("no-store", response.headers["Cache-Control"])
 
         self.assertIn("New random selected scenario", dashboard_html)
-        self.assertIn("Restart scenario", dashboard_html)
+        self.assertIn("Random Search of Area", dashboard_html)
+        self.assertIn('id="compact-replay-button"', dashboard_html)
+        self.assertIn("Restart current scenario", dashboard_html)
 
         truth = fetch_json(f"{self.urls[0]}/truth")
         self.assertEqual(APPLICATION_BUILD, truth["app_build"])
@@ -335,7 +494,7 @@ class PeerPropagationTest(unittest.TestCase):
             fetch_json(
                 f"{url}/control",
                 method="POST",
-                payload={"reset": True, "scenario_run_id": "peer-propagation-shared-run"},
+                payload={"reset": True, "scenario_run_id": "peer-propagation-shared-run", "sharing_enabled": False},
             )
 
     def cleanup_processes(self) -> None:

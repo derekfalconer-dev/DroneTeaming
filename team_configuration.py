@@ -9,7 +9,7 @@ from types import MappingProxyType
 from typing import Any
 
 
-SUPPORTED_ROLES = frozenset({"isr", "payload", "generalist"})
+SUPPORTED_ROLES = frozenset({"isr", "payload"})
 SUPPORTED_CAPABILITIES = frozenset({"atr_observe", "isr_observe", "payload_drop"})
 SUPPORTED_CAMERA_MOUNTS = frozenset({"fixed", "steerable"})
 TEAM_CONFIG_FIELDS = frozenset({"role", "capabilities", "available", "payload_inventory", "camera_mount"})
@@ -35,7 +35,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 class TeamMemberConfiguration:
     """One drone's role/capability/inventory advertisement."""
 
-    role: str = "generalist"
+    role: str = "isr"
     capabilities: tuple[str, ...] = ("atr_observe", "isr_observe")
     available: bool = True
     payload_inventory: MappingProxyType[str, int] = field(default_factory=lambda: MappingProxyType({}))
@@ -58,8 +58,6 @@ class TeamMemberConfiguration:
             raise TeamConfigurationError(f"{prefix}missing required configuration field(s): {', '.join(sorted(missing_fields))}")
 
         role = value["role"]
-        if role not in SUPPORTED_ROLES:
-            raise TeamConfigurationError(f"{prefix}invalid role: {role!r}")
 
         capabilities_value = value["capabilities"]
         if not isinstance(capabilities_value, list):
@@ -71,6 +69,21 @@ class TeamMemberConfiguration:
                 raise TeamConfigurationError(f"{prefix}invalid capability: {capability!r}")
             if capability not in capabilities:
                 capabilities.append(capability)
+
+        if role == "generalist":
+            has_isr = "isr_observe" in capabilities
+            has_payload = "payload_drop" in capabilities
+
+            if has_isr and has_payload:
+                raise TeamConfigurationError(f"{prefix}legacy generalist role with both ISR and payload capabilities is ambiguous; choose role 'isr' or 'payload'")
+            if has_payload:
+                role = "payload"
+            elif has_isr:
+                role = "isr"
+            else:
+                raise TeamConfigurationError(f"{prefix}legacy generalist role cannot be normalized without isr_observe or payload_drop capability")
+        elif role not in SUPPORTED_ROLES:
+            raise TeamConfigurationError(f"{prefix}invalid role: {role!r}")
 
         available = value["available"]
         if not isinstance(available, bool):

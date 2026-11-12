@@ -12,13 +12,13 @@ The supplied example configures Red and Blue as ISR drones and Green as a payloa
 
 Supported fields per drone are:
 
-- `role`: `isr`, `payload`, or `generalist`
+- `role`: `isr` or `payload`
 - `capabilities`: `atr_observe`, `isr_observe`, and/or `payload_drop`
 - `available`: boolean configured operational availability
 - `payload_inventory`: object of generic payload names to non-negative integer counts
 - `camera_mount`: `fixed` or `steerable`
 
-Role labels are descriptive only; they are not the eligibility rule. ISR execution eligibility requires configured availability, the `isr_observe` capability, and an available active-flight slot. Payload eligibility requires configured availability, `payload_drop`, and positive inventory of the requested payload type, but payload tasks are deliberately dormant in this increment.
+Role labels describe the primary aircraft setup; task eligibility is still driven by capabilities. ISR execution eligibility requires configured availability, the `isr_observe` capability, and an available active-flight slot. Payload eligibility requires configured availability, `payload_drop`, and positive inventory of the requested payload type. Legacy `generalist` configs are normalized only when their capabilities are unambiguous.
 
 Typed tasks now carry `task_type` and `contact_ref`. Existing priority observe/orbit work is `isr_observe`; its `contact_ref` is the mock priority signature evidence reference. Local map IDs remain node-local and are not used as common contact identity.
 

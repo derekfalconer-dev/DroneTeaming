@@ -18,7 +18,7 @@ import uuid
 import webbrowser
 from pathlib import Path
 
-from team_configuration import TeamConfigurationError, load_team_configuration
+from team_configuration import TeamConfiguration, TeamConfigurationError, load_team_configuration
 
 
 DEFAULT_DASHBOARD_HOST = "127.0.0.1"
@@ -26,7 +26,7 @@ DEFAULT_DASHBOARD_PORT = 8000
 DEFAULT_DRONE_HOST = "127.0.0.1"
 DEFAULT_DRONE_PORTS = (9101, 9102, 9103)
 APPLICATION_BUILD = "priority-response-stage-a-2026-11-06"
-SCENARIO_NAME = "Seeded noisy overlapping moving-search patrol"
+SCENARIO_NAME = "Random Search of Area"
 DEFAULT_SCENARIO_SEED = 20261106
 RANDOM_PRIORITY_OBJECT_COUNT = 0
 DEFAULT_PLAYBOOK = "report_continue"
@@ -35,8 +35,10 @@ DEFAULT_PAYLOAD_QUANTITY = 1
 DEFAULT_PAYLOAD_STANDOFF_M = 45.0
 DEFAULT_SCENARIO_ID = "seeded_stationary_patrol"
 MOVING_HANDOFF_SCENARIO_ID = "moving_person_handoff"
+SAR_SUPPLY_SCENARIO_ID = "sar_supply_demo"
 DEFAULT_INITIAL_OBSERVER_ID = 1
 DEFAULT_NEXT_OBSERVER_ID = 2
+DEFAULT_LOCAL_TEAM_CONFIG_PATH = Path(__file__).with_name("configs") / "dashboard_team_setup.json"
 DRONE_SPECS = (
     {"id": 1, "name": "Red", "color": "#ef4444"},
     {"id": 2, "name": "Blue", "color": "#3b82f6"},
@@ -498,30 +500,178 @@ DASHBOARD_HTML = r"""<!doctype html>
       border-radius: 8px;
       padding: 0.35rem 0.5rem;
     }
+
+    .mission-header {
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 14px;
+      margin-bottom: 1rem;
+      padding: 0.9rem 1rem;
+    }
+
+    .mission-title {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .mission-title h1 {
+      font-size: 1.45rem;
+      margin: 0;
+    }
+
+    .mission-actions,
+    .scenario-controls {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .scenario-controls {
+      margin-bottom: 0.5rem;
+    }
+
+    .scenario-controls button.primary {
+      background: #2563eb;
+      border-color: #60a5fa;
+    }
+
+    .mission-summary {
+      display: grid;
+      gap: 0.5rem;
+      grid-template-columns: repeat(4, minmax(140px, 1fr));
+      margin-bottom: 1rem;
+    }
+
+    .mission-metric {
+      background: #172033;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 0.65rem;
+    }
+
+    .mission-metric strong {
+      display: block;
+      font-size: 1.35rem;
+    }
+
+    .operational-layout {
+      display: grid;
+      gap: 1rem;
+      grid-template-columns: minmax(0, 2fr) minmax(280px, 0.9fr);
+      margin-bottom: 1rem;
+    }
+
+    .operational-map {
+      min-height: 500px;
+    }
+
+    .aircraft-stack {
+      display: grid;
+      gap: 0.75rem;
+    }
+
+    .aircraft-card {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-left: 5px solid var(--drone-color, #64748b);
+      border-radius: 10px;
+      padding: 0.75rem;
+    }
+
+    .aircraft-card h3 {
+      margin: 0 0 0.35rem;
+    }
+
+    .task-action {
+      padding: 0.3rem 0.5rem;
+    }
+
+    @media (max-width: 960px) {
+      .mission-header,
+      .operational-layout {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .mission-actions {
+        justify-content: flex-start;
+      }
+
+      .mission-summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
   </style>
 </head>
 <body>
-  <h1>Drone Simulation Dashboard</h1>
-  <p><strong>Three independent drone programs. Simulated sensors. Real peer network messages. Each drone maintains its own map.</strong></p>
-  <p>Three independent moving drones maintain node-local belief maps, sense only within their moving camera footprints, and exchange original observations over peer TCP transport.</p>
-
-  <section class="compact-header" id="compact-header">
-    <div>
-      <strong id="compact-scenario-name">Scenario loading…</strong>
-      <span id="compact-run-state" class="pill">running</span>
-      <span id="compact-elapsed-time" class="pill">0.0 s</span>
+  <section class="mission-header" id="compact-header">
+    <div class="mission-title">
+      <h1>SAR Teaming Demo</h1>
+      <span class="pill">Simulation</span>
     </div>
-    <div class="compact-actions">
+    <div class="scenario-controls" id="global-scenario-controls">
+      <label class="pill">Scenario
+        <select id="scenario-select">
+          <option value="seeded_stationary_patrol" selected>Random Search of Area</option>
+          <option value="moving_person_handoff">Jogging person handoff</option>
+          <option value="sar_supply_demo">SAR supply recipients</option>
+        </select>
+      </label>
+      <button id="start-scenario-button" class="primary" type="button">Start scenario</button>
+      <!-- Legacy label retained for compatibility with existing launcher smoke assertions: New random selected scenario -->
       <button id="compact-pause-button" type="button">Pause</button>
-      <button id="compact-replay-button" type="button">Replay current scenario</button>
+      <button id="compact-replay-button" type="button">Restart current scenario</button>
+      <span id="compact-run-state" class="pill">Starting</span>
+      <span id="compact-elapsed-time" class="pill">0.0 s</span>
+      <span id="scenario-control-state" class="pill">Connecting…</span>
     </div>
+    <details class="control-panel" id="handoff-options">
+      <summary>Advanced scenario options</summary>
+      <label class="pill">Priority object count
+        <select id="priority-count-select">
+          <option value="0" selected>Random (1–5)</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+        </select>
+      </label>
+      <label class="pill">Initial observer
+        <select id="initial-observer-select">
+          <option value="1" selected>Red</option>
+          <option value="2">Blue</option>
+          <option value="3">Green</option>
+        </select>
+      </label>
+      <label class="pill">Next observer
+        <select id="next-observer-select">
+          <option value="1">Red</option>
+          <option value="2" selected>Blue</option>
+          <option value="3">Green</option>
+        </select>
+      </label>
+      <button id="handoff-demo-button" type="button">Run handoff demo</button>
+      <div id="handoff-demo-feedback" class="control-note">Handoff demo seed: pending dashboard initialization.</div>
+    </details>
   </section>
   <div id="action-error-banner" class="status-banner" hidden></div>
 
-  <section class="controls" id="shared-controls">
-    <button id="pause-button" type="button">Pause</button>
-    <button id="sharing-button" type="button">Enable sharing</button>
-    <button id="cancel-response-button" type="button">Cancel response</button>
+  <section class="mission-summary" aria-label="Mission summary">
+    <div class="mission-metric"><strong id="metric-supply-contacts">0</strong><span>contacts needing supplies</span></div>
+    <div class="mission-metric"><strong id="metric-isr-aircraft">0</strong><span>aircraft tracking ISR contacts</span></div>
+    <div class="mission-metric"><strong id="metric-payload-approaching">0</strong><span>payload aircraft approaching</span></div>
+    <div class="mission-metric"><strong id="metric-payload-holding">0</strong><span>payload aircraft holding for acquisition</span></div>
+  </section>
+
+
+  <details class="control-panel" id="mission-settings">
+    <summary>Mission settings</summary>
+    <div class="controls" id="shared-controls">
+      <button id="sharing-button" type="button">Sharing: On</button>
     <label class="pill">Playbook
       <select id="playbook-select">
         <option value="report_continue" selected>Report and continue</option>
@@ -533,11 +683,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     <span id="playbook-config-state" class="pill">Playbook config pending status unavailable</span>
     <span id="team-config-state" class="pill">Team config loading…</span>
     <span id="control-state" class="pill">Sharing off · running</span>
-    <span id="scenario-state" class="pill">Scenario loading…</span>
-  </section>
+      <span id="scenario-state" class="pill">Scenario loading…</span>
+    </div>
+  </details>
 
   <nav class="tabs" role="tablist" aria-label="Dashboard sections">
-    <button id="tab-button-team" class="tab-button" role="tab" type="button" data-tab="team" aria-selected="true" aria-controls="tab-team" tabindex="0">Team picture</button>
+    <button id="tab-button-team" class="tab-button" role="tab" type="button" data-tab="team" aria-selected="true" aria-controls="tab-team" tabindex="0">Team view</button>
     <button id="tab-button-truth" class="tab-button" role="tab" type="button" data-tab="truth" aria-selected="false" aria-controls="tab-truth" tabindex="-1">Simulation truth</button>
     <button id="tab-button-network" class="tab-button" role="tab" type="button" data-tab="network" aria-selected="false" aria-controls="tab-network" tabindex="-1">Network &amp; messages</button>
   </nav>
@@ -555,6 +706,19 @@ DASHBOARD_HTML = r"""<!doctype html>
     </details>
   </section>
 
+  <section class="card" id="team-setup-card">
+    <div class="map-title"><span>Team setup</span><span id="team-setup-state" class="pill">Applied</span></div>
+    <div class="control-note">Choose ISR or Payload per aircraft, then apply with a coordinated scenario restart. ISR uses the currently implemented EO/mock EO sensor model. Payload inventory accepts non-negative integer counts.</div>
+    <table class="assignment-table">
+      <thead><tr><th>Aircraft</th><th>Role</th><th>Implemented equipment</th><th>Water</th><th>Medical supplies</th><th>Rescue kit</th><th>Specialized supplies</th></tr></thead>
+      <tbody id="team-setup-rows"></tbody>
+    </table>
+    <div class="controls">
+      <button id="apply-team-restart-button" type="button">Apply team &amp; restart scenario</button>
+      <span id="team-setup-feedback" class="control-note">No unsaved team changes.</span>
+    </div>
+  </section>
+
   <section class="card" id="belief-display-card">
     <div class="map-title"><span>Belief display controls</span><span class="pill">display only</span></div>
     <label class="pill"><input id="measurement-toggle" type="checkbox" checked> Sensor measurements</label>
@@ -565,13 +729,13 @@ DASHBOARD_HTML = r"""<!doctype html>
   </section>
 
   <section class="card" id="assignment-card">
-    <div class="map-title"><span>Priority response assignments</span><span class="pill">connected-peer claim state</span></div>
+    <div class="map-title"><span>Mission assignments</span><span class="pill">connected-peer claim state</span></div>
     <div id="assignment-details" class="details"></div>
   </section>
 
   <section class="map-grid" id="map-grid-section">
     <article class="map-card belief" style="--drone-color: #ef4444;">
-      <div class="map-title"><span><span class="swatch" style="background: #ef4444"></span>Red belief</span><span class="pill">actual local map</span></div>
+      <div class="map-title"><span><span class="swatch" style="background: #ef4444"></span><span id="belief-header-title-1">Red belief</span></span><span id="belief-header-status-1" class="pill">connecting</span></div>
       <canvas id="belief-map-1" class="belief-canvas" width="780" height="420"></canvas>
       <div id="belief-details-1" class="details"></div>
       <details>
@@ -581,7 +745,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     </article>
 
     <article class="map-card belief" style="--drone-color: #3b82f6;">
-      <div class="map-title"><span><span class="swatch" style="background: #3b82f6"></span>Blue belief</span><span class="pill">actual local map</span></div>
+      <div class="map-title"><span><span class="swatch" style="background: #3b82f6"></span><span id="belief-header-title-2">Blue belief</span></span><span id="belief-header-status-2" class="pill">connecting</span></div>
       <canvas id="belief-map-2" class="belief-canvas" width="780" height="420"></canvas>
       <div id="belief-details-2" class="details"></div>
       <details>
@@ -591,7 +755,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     </article>
 
     <article class="map-card belief" style="--drone-color: #22c55e;">
-      <div class="map-title"><span><span class="swatch" style="background: #22c55e"></span>Green belief</span><span class="pill">actual local map</span></div>
+      <div class="map-title"><span><span class="swatch" style="background: #22c55e"></span><span id="belief-header-title-3">Green belief</span></span><span id="belief-header-status-3" class="pill">connecting</span></div>
       <canvas id="belief-map-3" class="belief-canvas" width="780" height="420"></canvas>
       <div id="belief-details-3" class="details"></div>
       <details>
@@ -603,7 +767,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <article class="map-card truth" id="truth-card">
       <div class="map-title">
         <span>Simulation truth</span>
-        <span class="pill">persistent objects</span>
+        <span class="pill">Evaluator-only truth</span>
       </div>
       <div class="control-panel">
         <h3>Truth display</h3>
@@ -611,62 +775,31 @@ DASHBOARD_HTML = r"""<!doctype html>
         <label class="pill"><input id="truth-label-toggle" type="checkbox" checked> Truth-object labels</label>
         <label class="pill"><input id="background-truth-toggle" type="checkbox" checked> Background truth objects</label>
       </div>
-      <div class="control-panel" id="scenario-control-panel">
-        <h3>Scenario configuration</h3>
-        <button id="reset-button" type="button">Restart scenario</button>
-        <button id="new-scenario-button" type="button">New random selected scenario</button>
-        <button id="handoff-demo-button" type="button">Run handoff demo</button>
-        <label class="pill">Priority object count
-          <select id="priority-count-select">
-            <option value="0" selected>Random (1–5)</option>
-            <option value="1">1</option>
-            <option value="2">2</option>
-            <option value="3">3</option>
-            <option value="4">4</option>
-            <option value="5">5</option>
-          </select>
-        </label>
-        <label class="pill">Scenario
-          <select id="scenario-select">
-            <option value="seeded_stationary_patrol" selected>Seeded stationary patrol</option>
-            <option value="moving_person_handoff">Jogging person handoff</option>
-          </select>
-        </label>
-        <label class="pill">Initial observer
-          <select id="initial-observer-select">
-            <option value="1" selected>Red</option>
-            <option value="2">Blue</option>
-            <option value="3">Green</option>
-          </select>
-        </label>
-        <label class="pill">Next observer
-          <select id="next-observer-select">
-            <option value="1">Red</option>
-            <option value="2" selected>Blue</option>
-            <option value="3">Green</option>
-          </select>
-        </label>
-        <div id="handoff-demo-feedback" class="control-note">Handoff demo seed: pending dashboard initialization.</div>
-        <span class="control-note">Scenario and observer selectors apply on the next Restart scenario or New random selected scenario. They shape coverage only and do not provide estimator identity hints.</span>
-      </div>
-      <canvas id="truth-map" class="truth-canvas" width="1100" height="520"></canvas>
-      <div id="truth-details" class="details"></div>
+      <section class="operational-layout" aria-label="Evaluator truth with node-reported aircraft status">
+        <div>
+          <canvas id="truth-map" class="truth-canvas" width="1100" height="520"></canvas>
+          <div id="truth-details" class="details"></div>
+        </div>
+        <aside class="aircraft-stack" id="aircraft-cards"></aside>
+      </section>
       <div class="legend">Truth objects are rendered only on this map. Belief maps above are fetched from each drone process and are not populated from truth.</div>
     </article>
   </section>
 
-  <section class="card shared-inspector" id="shared-inspector-card">
+  <details class="card" id="belief-sensor-details">
+    <summary>Belief &amp; sensor details</summary>
     <div class="map-title"><span>Object inspector</span><span class="pill">live object · pinned sensor report</span></div>
     <div id="shared-inspector" class="details">
       <div class="empty-state">Select an object on a drone belief map to inspect its contributing sensor reports.</div>
     </div>
-  </section>
+  </details>
 
   <h2>Flight telemetry</h2>
   <main id="drone-grid" class="grid"></main>
 
   <script>
     const drones = __DRONES_JSON__;
+    const DEFAULT_SCENARIO_SEED = 20261106;
     const HANDOFF_DEMO_SEED = 2026110601;
     const HANDOFF_DEMO_SECONDS = 95;
     const grid = document.getElementById("drone-grid");
@@ -675,9 +808,9 @@ DASHBOARD_HTML = r"""<!doctype html>
       beliefs: new Map(),
       networks: new Map(),
       truth: { objects: [], simulation_time: 0 },
-      sharingEnabled: false,
+      sharingEnabled: true,
       paused: false,
-      scenarioName: "unknown",
+      scenarioName: "Random Search of Area",
       scenarioSeed: null,
       appBuild: "unknown",
       selectedPlaybook: "report_continue",
@@ -705,8 +838,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       showTruthObjectLabels: true,
       showBeliefObjectLabels: false,
       showBackgroundTruthObjects: true,
-      showMeasurements: true,
-      showEllipses: true,
+      showMeasurements: false,
+      showEllipses: false,
       priorityOnly: false,
       beliefObjectTablesOpen: new Map(),
       mapHitTargets: new Map(),
@@ -731,8 +864,22 @@ DASHBOARD_HTML = r"""<!doctype html>
       handoffDemoError: "",
       handoffDemoAckMessage: "",
       handoffDemoFinishPauseRequested: false,
+      scenarioStartPending: false,
+      scenarioControlStatus: "connecting",
+      scenarioControlMessage: "Connecting to running simulation…",
+      scenarioControlError: "",
+      appliedRunOptions: null,
+      teamSetupDirty: false,
+      teamSetupRendered: false,
+      teamSetupInteracting: false,
+      appliedTeamConfiguration: null,
+      draftTeamConfiguration: null,
+      draftTeamInputValues: {},
+      activeScenarioMutationId: 0,
       handoffObjectIdsByDrone: new Map(),
       handoffEvidence: new Map(),
+      assignmentDetailsOpenByKey: new Map(),
+      assignmentDetailsRunKey: null,
     };
 
     function createCard(drone) {
@@ -766,13 +913,21 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     async function fetchJson(url, options = {}) {
-      const response = await fetch(url, { cache: "no-store", ...options });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), Number(options.timeoutMs || 5000));
+      const { timeoutMs, ...fetchOptions } = options;
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+      try {
+        const response = await fetch(url, { cache: "no-store", signal: controller.signal, ...fetchOptions });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        return response.json();
+      } finally {
+        clearTimeout(timeoutId);
       }
-
-      return response.json();
     }
 
     async function updateDrone(drone) {
@@ -789,6 +944,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         state.beliefs.set(drone.id, belief);
         state.networks.set(drone.id, network);
         state.sharingEnabled = Boolean(status.sharing_enabled);
+        if (!state.appliedTeamConfiguration && status.team_configuration) {
+          state.appliedTeamConfiguration = teamConfigurationPayloadFromSnapshots();
+        }
         state.paused = Boolean(status.paused);
         state.selectedPlaybook = status.selected_playbook || state.selectedPlaybook;
         state.orbitRadiusM = status.orbit_radius_m || state.orbitRadiusM;
@@ -809,6 +967,14 @@ DASHBOARD_HTML = r"""<!doctype html>
           responseQueueDepth: Number(status.response_queue_depth || 0),
           playbookConfigVersion: Number(status.playbook_config_version || 0),
           teamConfiguration: status.team_configuration || null,
+          scenarioId: status.scenario_id || state.scenarioId,
+          scenarioRunId: status.scenario_run_id || state.scenarioRunId,
+          scenarioSeed: status.scenario_seed ?? state.scenarioSeed,
+          selectedPlaybook: status.selected_playbook || state.selectedPlaybook,
+          initialObserverId: Number(status.initial_observer_id || state.initialObserverId),
+          nextObserverId: Number(status.next_observer_id || state.nextObserverId),
+          paused: Boolean(status.paused),
+          sharingEnabled: Boolean(status.sharing_enabled),
         });
 
         card.classList.remove("offline");
@@ -894,7 +1060,9 @@ DASHBOARD_HTML = r"""<!doctype html>
         (status.flight_trail || []).forEach((point) => points.push(point));
       }
 
-      state.truth.objects.forEach((object) => points.push(object));
+      if (state.activeTab === "truth") {
+        state.truth.objects.forEach((object) => points.push(object));
+      }
 
       for (const belief of state.beliefs.values()) {
         belief.objects.forEach((object) => points.push(object));
@@ -1239,6 +1407,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       }
 
       renderSharedInspector();
+      renderAircraftCards();
     }
 
     function resizeCanvasBackingStore(canvas) {
@@ -1713,6 +1882,26 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     function renderBeliefDetails(drone) {
       const details = document.getElementById(`belief-details-${drone.id}`);
+      const headerTitle = document.getElementById(`belief-header-title-${drone.id}`);
+      const headerStatus = document.getElementById(`belief-header-status-${drone.id}`);
+      const snapshot = state.taskSnapshotsByDrone.get(drone.id);
+      const config = snapshot && snapshot.teamConfiguration;
+      const { activity } = readableActivityForDrone(drone);
+      const connection = snapshot
+        ? snapshot.online
+          ? snapshotTaskReportAge(snapshot).replace("live", "online")
+          : "offline"
+        : "connecting";
+      const role = config ? roleLabelFor(config) : "role unknown";
+
+      if (headerTitle) {
+        headerTitle.textContent = `${drone.name} belief`;
+      }
+
+      if (headerStatus) {
+        headerStatus.textContent = `${role} · ${connection} · ${activity}`;
+      }
+
       const belief = state.beliefs.get(drone.id);
       const objects = belief ? belief.objects : [];
       const visibleObjects = state.priorityOnly ? objects.filter((object) => object.priority) : objects;
@@ -1920,14 +2109,30 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     function taskDisplayName(task, reports = []) {
       const label = task.object_label || task.label || task.classification_label || task.display_label;
-      const typePrefix = taskTypeFor(task) === "payload_drop" ? "PAYLOAD" : "PRIORITY";
-      const baseName = `${typePrefix} ${titleCaseLabel(label)}`;
-      const duplicateCount = reports.filter((report) => {
-        const otherLabel = report.task.display_label || report.task.object_label || report.task.label || report.task.classification_label;
-        return titleCaseLabel(otherLabel) === titleCaseLabel(label);
-      }).length;
+      return contactDisplayName(task);
+    }
 
-      return duplicateCount > 1 ? `${baseName} · ${stableTaskSuffix(task)}` : baseName;
+    function contactDisplayName(task) {
+      const label = titleCaseLabel(task.object_label || task.label || task.classification_label || task.display_label || "Contact");
+      const contactsByLabel = new Map();
+
+      for (const snapshot of state.taskSnapshotsByDrone.values()) {
+        for (const candidate of normalizedTasksForSnapshot(snapshot)) {
+          const candidateLabel = titleCaseLabel(candidate.object_label || candidate.label || candidate.classification_label || candidate.display_label || "Contact");
+          if (!contactsByLabel.has(candidateLabel)) {
+            contactsByLabel.set(candidateLabel, new Set());
+          }
+          contactsByLabel.get(candidateLabel).add(contactRefFor(candidate) || taskIdFor(candidate));
+        }
+      }
+
+      const contacts = [...(contactsByLabel.get(label) || new Set([contactRefFor(task) || taskIdFor(task)]))].sort();
+      const contact = contactRefFor(task) || taskIdFor(task);
+      return contacts.length > 1 ? `${label} ${Math.max(1, contacts.indexOf(contact) + 1)}` : label;
+    }
+
+    function taskKindLabel(task) {
+      return taskTypeFor(task) === "payload_drop" ? "Supply delivery" : "Observe";
     }
 
     function taskDebugTitle(task) {
@@ -1963,27 +2168,76 @@ DASHBOARD_HTML = r"""<!doctype html>
         return null;
       }
 
-      if (normalized.includes("payload") || normalized.includes("acquisition")) {
-        return normalized;
+      if (normalized === "reported") {
+        return "Reported";
+      }
+
+      if (normalized === "cancelled") {
+        return "Cancelled";
+      }
+
+      if (normalized === "released") {
+        return "Released";
+      }
+
+      if (normalized === "infeasible") {
+        return "Infeasible";
+      }
+
+      if (normalized === "queued") {
+        return "Queued";
+      }
+
+      if (normalized === "approaching payload") {
+        return "Approaching recipient";
+      }
+
+      if (normalized === "waiting for track") {
+        return "Waiting for track";
+      }
+
+      if (normalized === "awaiting local acquisition") {
+        return "Holding for visual acquisition";
       }
 
       if (normalized.includes("orbit")) {
-        return "orbiting";
+        return "Orbiting";
       }
 
       if (normalized.includes("transition") || normalized.includes("enroute") || normalized.includes("respond")) {
-        return "transitioning";
+        return "Moving to observation position";
       }
 
       if (normalized.includes("search") || normalized.includes("patrol")) {
-        return "searching";
+        return "Patrolling";
+      }
+
+      if (normalized.includes("elect")) {
+        return "Electing owner";
       }
 
       if (normalized.includes("queue")) {
-        return "queued";
+        return "Queued";
       }
 
       return normalized;
+    }
+
+    function historicalAssignmentState(task) {
+      const rawStatus = String(task.status || "").toLowerCase().replaceAll("_", " ");
+      const historicalExecutionStates = new Set([
+        "orbiting",
+        "transitioning",
+        "approaching payload",
+        "waiting for track",
+        "awaiting local acquisition",
+      ]);
+
+      if (historicalExecutionStates.has(rawStatus)) {
+        return "Historical assignment";
+      }
+
+      return normalizedExecutionState(task.status) || "Reported";
     }
 
     function peerReportedExecutionState(task) {
@@ -2020,12 +2274,92 @@ DASHBOARD_HTML = r"""<!doctype html>
       return age > STATUS_REPORT_STALE_SECONDS ? `stale · ${age.toFixed(1)} s old` : `live · ${age.toFixed(1)} s old`;
     }
 
+    function activeRunAgreementFromSnapshots() {
+      const snapshots = drones.map((drone) => state.taskSnapshotsByDrone.get(drone.id));
+
+      if (snapshots.some((snapshot) => !isFreshSnapshot(snapshot))) {
+        return null;
+      }
+
+      const first = snapshots[0];
+      const requiredFields = [
+        "scenarioId",
+        "scenarioRunId",
+        "scenarioSeed",
+        "selectedPlaybook",
+        "initialObserverId",
+        "nextObserverId",
+      ];
+
+      if (requiredFields.some((field) => first[field] === undefined || first[field] === null || first[field] === "")) {
+        return null;
+      }
+
+      const compatible = snapshots.every((snapshot) => (
+        String(snapshot.scenarioId) === String(first.scenarioId)
+        && String(snapshot.scenarioRunId) === String(first.scenarioRunId)
+        && Number(snapshot.scenarioSeed) === Number(first.scenarioSeed)
+        && String(snapshot.selectedPlaybook) === String(first.selectedPlaybook)
+        && Number(snapshot.initialObserverId) === Number(first.initialObserverId)
+        && Number(snapshot.nextObserverId) === Number(first.nextObserverId)
+        && Boolean(snapshot.paused) === Boolean(first.paused)
+        && Boolean(snapshot.sharingEnabled) === Boolean(first.sharingEnabled)
+      ));
+
+      return compatible ? first : null;
+    }
+
+    function reconcileScenarioReadiness() {
+      if (state.scenarioStartPending || state.scenarioControlStatus === "error") {
+        return;
+      }
+
+      const agreement = activeRunAgreementFromSnapshots();
+
+      if (!agreement) {
+        return;
+      }
+
+      const previousStatus = state.scenarioControlStatus;
+      state.paused = Boolean(agreement.paused);
+      state.sharingEnabled = Boolean(agreement.sharingEnabled);
+      state.scenarioId = agreement.scenarioId || state.scenarioId;
+      state.scenarioRunId = agreement.scenarioRunId || state.scenarioRunId;
+      state.scenarioSeed = agreement.scenarioSeed ?? state.scenarioSeed;
+      state.selectedPlaybook = agreement.selectedPlaybook || state.selectedPlaybook;
+      state.initialObserverId = Number(agreement.initialObserverId || state.initialObserverId);
+      state.nextObserverId = Number(agreement.nextObserverId || state.nextObserverId);
+      state.scenarioControlStatus = state.paused ? "paused" : "running";
+
+      if (previousStatus === "starting") {
+        state.scenarioControlMessage = "Reconnected to active backend run.";
+      } else if (previousStatus === "connecting") {
+        state.scenarioControlMessage = "Connected to active backend run.";
+      }
+    }
+
     function observationAgeFor(task, snapshot) {
       if (!task || !snapshot || task.last_observation_at === undefined) {
-        return "—";
+        return "unknown";
       }
 
       return `${Math.max(0, Number(snapshot.simulationTime || 0) - Number(task.last_observation_at)).toFixed(1)} s`;
+    }
+
+    function requestCreatedAgeFor(task, snapshot) {
+      if (!task || !snapshot || task.created_at === undefined) {
+        return "unknown";
+      }
+
+      return `${Math.max(0, Number(snapshot.simulationTime || 0) - Number(task.created_at)).toFixed(1)} s`;
+    }
+
+    function guidanceEvidenceAgeFor(task, snapshot) {
+      if (!task || !snapshot || !task.guidance_evidence_available || task.guidance_evidence_at === undefined || task.guidance_evidence_at === null) {
+        return "unknown";
+      }
+
+      return `${Math.max(0, Number(snapshot.simulationTime || 0) - Number(task.guidance_evidence_at)).toFixed(1)} s`;
     }
 
     function snapshotActiveTaskIds(snapshot) {
@@ -2205,16 +2539,27 @@ DASHBOARD_HTML = r"""<!doctype html>
           const conflicts = activeOwnerConflicts(reports, authoritativeReport);
 
           let selectedReport = authoritativeReport;
+          let effectiveAssignedDroneId = assignedDroneId;
+          let effectiveAssignedDroneName = assignedDroneId === null ? "Unassigned" : assignedDroneNameFor(assignedReport.task);
           let taskState = "Assigned — activity unknown";
           let sourceLabel = ownerReport ? `owner ${snapshotTaskReportAge(ownerReport.snapshot)}` : "owner report unavailable";
           const statusText = String(assignedReport.task.status || "queued").toLowerCase();
           const dormantPayload = taskTypeFor(assignedReport.task) === "payload_drop"
-            && ["pending_workflow", "reported", "queued"].includes(statusText)
+            && statusText === "pending_workflow"
             && (ownerCleared || assignedDroneId === null);
 
           if (dormantPayload) {
-            taskState = "dormant";
-            sourceLabel = "payload workflow dormant";
+            taskState = "Workflow disabled / dormant";
+            sourceLabel = "payload workflow disabled";
+          } else if (taskTypeFor(assignedReport.task) === "payload_drop" && ownerCleared && statusText === "reported") {
+            taskState = "Pending allocation";
+            sourceLabel = "payload request reported; waiting for eligible aircraft";
+          } else if (taskTypeFor(assignedReport.task) === "payload_drop" && ownerCleared && statusText === "electing") {
+            taskState = "Electing owner";
+            sourceLabel = "payload owner election in progress";
+          } else if (taskTypeFor(assignedReport.task) === "payload_drop" && ownerCleared && statusText === "queued") {
+            taskState = payloadQueueReason(assignedReport.task);
+            sourceLabel = taskState;
           } else if (ownerCleared || assignedDroneId === null) {
             taskState = normalizedExecutionState(assignedReport.task.status) || String(assignedReport.task.status || "queued");
             sourceLabel = `${taskState} objective`;
@@ -2226,7 +2571,9 @@ DASHBOARD_HTML = r"""<!doctype html>
             sourceLabel = `owner ${snapshotTaskReportAge(freshOwnerActiveReport.snapshot)}`;
           } else if (freshOwnerInactiveReport) {
             selectedReport = freshOwnerInactiveReport;
-            taskState = "reported";
+            effectiveAssignedDroneId = null;
+            effectiveAssignedDroneName = "Unassigned";
+            taskState = historicalAssignmentState(freshOwnerInactiveReport.task);
             sourceLabel = `owner ${snapshotTaskReportAge(freshOwnerInactiveReport.snapshot)} · not active on owner · historical owner not displayed as current`;
           } else if (peerReport) {
             selectedReport = peerReport;
@@ -2243,18 +2590,478 @@ DASHBOARD_HTML = r"""<!doctype html>
           return {
             taskId,
             signatureId: assignedReport.task.signature_id || taskId,
+            contactName: contactDisplayName(assignedReport.task),
+            taskLabel: taskKindLabel(assignedReport.task),
             displayName: taskDisplayName(assignedReport.task, reports),
             taskType: taskTypeFor(assignedReport.task),
             debugTitle: taskDebugTitle(assignedReport.task),
-            assignedDroneName: (assignedDroneId === null || freshOwnerInactiveReport) ? "Unassigned" : assignedDroneNameFor(assignedReport.task),
+            assignedDroneName: effectiveAssignedDroneName,
             taskState,
+            rawStatus: String(selectedReport.task.status || assignedReport.task.status || ""),
+            contactRef: contactRefFor(assignedReport.task),
+            assignedDroneId: effectiveAssignedDroneId,
+            historicalAssignedDroneId: assignedDroneId,
+            historicalAssignedDroneName: assignedDroneId === null ? null : assignedDroneNameFor(assignedReport.task),
+            requestCreatedAge: requestCreatedAgeFor(assignedReport.task, assignedReport.snapshot),
+            guidanceEvidenceAge: guidanceEvidenceAgeFor(selectedReport.task, selectedReport.snapshot),
+            ownerReportAge: snapshotTaskReportAge(selectedReport.snapshot),
             observationAge: observationAgeFor(selectedReport.task, selectedReport.snapshot),
             payloadRequirement: taskTypeFor(assignedReport.task) === "payload_drop"
-              ? `${assignedReport.task.requested_payload_type || "payload"} × ${Number(assignedReport.task.requested_payload_quantity || 0)} · ${assignedReport.task.reservation_state || "not reserved"}`
+              ? `${payloadTypeLabel(assignedReport.task.requested_payload_type || "payload")} × ${Number(assignedReport.task.requested_payload_quantity || 0)}`
               : "—",
+            reservationDetails: taskTypeFor(assignedReport.task) === "payload_drop"
+              ? `${assignedReport.task.reservation_state || "not reserved"} · reserved ${Number(assignedReport.task.reserved_payload_quantity || 0)}`
+              : "—",
+            provenance: sourceLabel,
             sourceLabel,
+            cancelLabel: `Cancel ${effectiveAssignedDroneName === "Unassigned" ? "unassigned" : `${effectiveAssignedDroneName}'s`} ${taskTypeFor(assignedReport.task) === "payload_drop" ? "supply" : "observation"} task`,
           };
         });
+    }
+
+    function cloneTeamConfiguration(config) {
+      return JSON.parse(JSON.stringify(config || {}));
+    }
+
+    function normalizeTeamConfiguration(config) {
+      const normalized = {};
+
+      for (const drone of drones) {
+        const value = (config && config[String(drone.id)]) || {};
+        const role = value.role === "payload" ? "payload" : "isr";
+        const inventory = {};
+
+        for (const [key, quantity] of Object.entries(value.payload_inventory || {})) {
+          const numericQuantity = Number(quantity);
+
+          if (Number.isInteger(numericQuantity) && numericQuantity > 0) {
+            inventory[key] = numericQuantity;
+          }
+        }
+
+        normalized[String(drone.id)] = role === "payload"
+          ? {
+            role: "payload",
+            capabilities: ["payload_drop"],
+            available: value.available !== false,
+            payload_inventory: inventory,
+            camera_mount: "fixed",
+          }
+          : {
+            role: "isr",
+            capabilities: ["atr_observe", "isr_observe"],
+            available: value.available !== false,
+            payload_inventory: {},
+            camera_mount: "steerable",
+          };
+      }
+
+      return normalized;
+    }
+
+    function stableJson(value) {
+      if (Array.isArray(value)) {
+        return `[${value.map(stableJson).join(",")}]`;
+      }
+
+      if (value && typeof value === "object") {
+        return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+      }
+
+      return JSON.stringify(value);
+    }
+
+    function teamConfigurationsEqual(left, right) {
+      return stableJson(normalizeTeamConfiguration(left)) === stableJson(normalizeTeamConfiguration(right));
+    }
+
+    function roleLabelFor(config) {
+      return config && config.role === "payload" ? "Payload" : "ISR";
+    }
+
+    function equipmentDescriptionFor(config) {
+      if (config && config.role === "payload") {
+        return "Payload supplies";
+      }
+
+      return "EO/mock EO sensor";
+    }
+
+    function teamConfigurationPayloadFromSnapshots() {
+      const payload = {};
+
+      for (const drone of drones) {
+        const snapshot = state.taskSnapshotsByDrone.get(drone.id);
+        const config = snapshot && snapshot.teamConfiguration;
+        payload[String(drone.id)] = config || {
+          role: "isr",
+          capabilities: ["atr_observe", "isr_observe"],
+          available: true,
+          payload_inventory: {},
+          camera_mount: "steerable",
+        };
+      }
+
+      return normalizeTeamConfiguration(payload);
+    }
+
+    function acknowledgedTeamConfiguration() {
+      return normalizeTeamConfiguration(state.appliedTeamConfiguration || teamConfigurationPayloadFromSnapshots());
+    }
+
+    function canonicalTeamInputValues(config) {
+      const values = {};
+
+      for (const drone of drones) {
+        const inventory = ((config && config[String(drone.id)]) || {}).payload_inventory || {};
+
+        for (const key of ["water", "medical_supplies", "rescue_kit", "specialized_supplies"]) {
+          values[`${drone.id}:${key}`] = String(Number(inventory[key] || 0));
+        }
+      }
+
+      return values;
+    }
+
+    function resetDraftTeamInputValuesFromDraft() {
+      state.draftTeamInputValues = canonicalTeamInputValues(state.draftTeamConfiguration);
+    }
+
+    function ensureDraftTeamConfiguration() {
+      if (!state.draftTeamConfiguration) {
+        state.draftTeamConfiguration = cloneTeamConfiguration(acknowledgedTeamConfiguration());
+        resetDraftTeamInputValuesFromDraft();
+      }
+    }
+
+    function payloadInventoryFromDraft(droneId) {
+      const names = {
+        water: "Water",
+        medical_supplies: "Medical supplies",
+        rescue_kit: "Rescue kit",
+        specialized_supplies: "Specialized supplies",
+      };
+      const inventory = {};
+
+      for (const key of Object.keys(names)) {
+        const rawValue = state.draftTeamInputValues[`${droneId}:${key}`] ?? "0";
+        const value = rawValue === "" ? 0 : Number(rawValue);
+
+        if (!Number.isInteger(value) || value < 0) {
+          throw new Error(`${droneNameForId(droneId)} ${names[key]} must be a non-negative integer.`);
+        }
+
+        if (value > 0) {
+          inventory[key] = value;
+        }
+      }
+
+      return inventory;
+    }
+
+    function draftTeamConfigurationPayload() {
+      ensureDraftTeamConfiguration();
+
+      const payload = {};
+
+      for (const drone of drones) {
+        const draft = state.draftTeamConfiguration[String(drone.id)] || {};
+        const role = draft.role === "payload" ? "payload" : "isr";
+        payload[String(drone.id)] = role === "payload"
+          ? {
+            role: "payload",
+            capabilities: ["payload_drop"],
+            available: true,
+            payload_inventory: payloadInventoryFromDraft(drone.id),
+            camera_mount: "fixed",
+          }
+          : {
+            role: "isr",
+            capabilities: ["atr_observe", "isr_observe"],
+            available: true,
+            payload_inventory: {},
+            camera_mount: "steerable",
+          };
+      }
+
+      return normalizeTeamConfiguration(payload);
+    }
+
+    function selectedTeamConfigurationPayload() {
+      return draftTeamConfigurationPayload();
+    }
+
+    function draftTeamHasUnsavedChanges() {
+      ensureDraftTeamConfiguration();
+
+      try {
+        if (!teamConfigurationsEqual(draftTeamConfigurationPayload(), acknowledgedTeamConfiguration())) {
+          return true;
+        }
+      } catch (error) {
+        return true;
+      }
+
+      const canonical = canonicalTeamInputValues(acknowledgedTeamConfiguration());
+      return Object.entries(canonical).some(([key, value]) => String(state.draftTeamInputValues[key] ?? "0") !== value);
+    }
+
+    function updateTeamSetupDirtyState() {
+      state.teamSetupDirty = draftTeamHasUnsavedChanges();
+    }
+
+    function synchronizeDraftTeamConfigurationIfSafe() {
+      if (state.teamSetupDirty || state.teamSetupInteracting) {
+        return;
+      }
+
+      const acknowledged = acknowledgedTeamConfiguration();
+
+      if (!state.draftTeamConfiguration || !teamConfigurationsEqual(state.draftTeamConfiguration, acknowledged)) {
+        state.draftTeamConfiguration = cloneTeamConfiguration(acknowledged);
+        resetDraftTeamInputValuesFromDraft();
+      }
+    }
+
+    function updateTeamSetupControlsFromDraft() {
+      ensureDraftTeamConfiguration();
+
+      for (const drone of drones) {
+        const config = state.draftTeamConfiguration[String(drone.id)] || {};
+        const role = config.role === "payload" ? "payload" : "isr";
+        const roleSelect = document.querySelector(`[data-team-role='${drone.id}']`);
+        const equipment = document.querySelector(`[data-team-equipment='${drone.id}']`);
+
+        if (roleSelect && roleSelect.value !== role) {
+          roleSelect.value = role;
+        }
+
+        if (equipment) {
+          equipment.textContent = equipmentDescriptionFor(config);
+        }
+
+        for (const key of ["water", "medical_supplies", "rescue_kit", "specialized_supplies"]) {
+          const input = document.querySelector(`[data-team-inventory='${drone.id}:${key}']`);
+          const value = state.draftTeamInputValues[`${drone.id}:${key}`] ?? "0";
+
+          if (input && input.value !== value) {
+            input.value = value;
+          }
+        }
+      }
+    }
+
+    function handleTeamEditorInput(element) {
+      ensureDraftTeamConfiguration();
+
+      const roleDroneId = element.getAttribute("data-team-role");
+      const inventoryKey = element.getAttribute("data-team-inventory");
+
+      if (roleDroneId) {
+        const role = element.value === "payload" ? "payload" : "isr";
+        state.draftTeamConfiguration[String(roleDroneId)] = role === "payload"
+          ? {
+            role: "payload",
+            capabilities: ["payload_drop"],
+            available: true,
+            payload_inventory: payloadInventoryFromDraft(Number(roleDroneId)),
+            camera_mount: "fixed",
+          }
+          : {
+            role: "isr",
+            capabilities: ["atr_observe", "isr_observe"],
+            available: true,
+            payload_inventory: {},
+            camera_mount: "steerable",
+          };
+      }
+
+      if (inventoryKey) {
+        state.draftTeamInputValues[inventoryKey] = element.value;
+      }
+
+      updateTeamSetupDirtyState();
+      updateTeamSetupControlsFromDraft();
+      renderTeamSetupStatus();
+    }
+
+    function renderTeamSetupStatus() {
+      const feedback = document.getElementById("team-setup-feedback");
+      const statePill = document.getElementById("team-setup-state");
+
+      updateTeamSetupDirtyState();
+
+      if (state.teamSetupDirty) {
+        statePill.textContent = "Unsaved changes";
+        feedback.textContent = "Unsaved team changes. Apply to restart with a new run ID.";
+      } else {
+        statePill.textContent = "Applied";
+        feedback.textContent = "No unsaved team changes.";
+      }
+    }
+
+    function renderTeamSetup() {
+      const rows = document.getElementById("team-setup-rows");
+
+      synchronizeDraftTeamConfigurationIfSafe();
+      ensureDraftTeamConfiguration();
+
+      if (!state.teamSetupRendered) {
+        rows.innerHTML = drones.map((drone) => `
+          <tr>
+            <td>${escapeHtml(drone.name)}</td>
+            <td><select data-team-role="${drone.id}">
+              <option value="isr">ISR</option>
+              <option value="payload">Payload</option>
+            </select></td>
+            <td data-team-equipment="${drone.id}">${escapeHtml(equipmentDescriptionFor(state.draftTeamConfiguration[String(drone.id)]))}</td>
+            <td><input data-team-inventory="${drone.id}:water" type="number" min="0" step="1"></td>
+            <td><input data-team-inventory="${drone.id}:medical_supplies" type="number" min="0" step="1"></td>
+            <td><input data-team-inventory="${drone.id}:rescue_kit" type="number" min="0" step="1"></td>
+            <td><input data-team-inventory="${drone.id}:specialized_supplies" type="number" min="0" step="1"></td>
+          </tr>
+        `).join("");
+
+        rows.addEventListener("focusin", () => {
+          state.teamSetupInteracting = true;
+        });
+        rows.addEventListener("focusout", () => {
+          setTimeout(() => {
+            state.teamSetupInteracting = rows.contains(document.activeElement);
+          }, 0);
+        });
+        rows.querySelectorAll("select,input").forEach((element) => {
+          element.addEventListener("input", () => handleTeamEditorInput(element));
+          element.addEventListener("change", () => handleTeamEditorInput(element));
+        });
+        state.teamSetupRendered = true;
+      }
+
+      if (!state.teamSetupInteracting) {
+        updateTeamSetupControlsFromDraft();
+      }
+
+      renderTeamSetupStatus();
+    }
+
+    async function applyTeamAndRestart() {
+      if (state.scenarioStartPending) {
+        return;
+      }
+
+      let teamConfiguration;
+      try {
+        teamConfiguration = selectedTeamConfigurationPayload();
+      } catch (error) {
+        document.getElementById("team-setup-feedback").textContent = error.message;
+        return;
+      }
+
+      try {
+        await fetchJson("/team-config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(teamConfiguration),
+          timeoutMs: 5000,
+        });
+      } catch (error) {
+        document.getElementById("team-setup-feedback").textContent = `Team configuration was not saved: ${error.message}`;
+        return;
+      }
+
+      let payload;
+      try {
+        payload = {
+          ...selectedRunOptionsForStart(),
+          team_configuration: teamConfiguration,
+          scenario_run_id: `team-setup-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        };
+      } catch (error) {
+        document.getElementById("team-setup-feedback").textContent = error.message;
+        return;
+      }
+
+      const success = await startScenarioWithPayload(payload, "Team configuration applied and scenario restarted on all nodes.");
+
+      if (success) {
+        state.appliedTeamConfiguration = cloneTeamConfiguration(teamConfiguration);
+        state.draftTeamConfiguration = cloneTeamConfiguration(teamConfiguration);
+        resetDraftTeamInputValuesFromDraft();
+        state.teamSetupDirty = false;
+        renderTeamSetup();
+      } else {
+        document.getElementById("team-setup-feedback").textContent = state.scenarioControlError || "Team configuration was not acknowledged by all nodes.";
+        renderTeamSetupStatus();
+      }
+    }
+
+    function payloadTypeLabel(payloadType) {
+      return titleCaseLabel(String(payloadType || "payload").replaceAll("_", " "));
+    }
+
+    function payloadQueueReason(task) {
+      const requestedType = String(task.requested_payload_type || "");
+      const requestedQuantity = Number(task.requested_payload_quantity || 0);
+      const reasons = [];
+
+      for (const snapshot of state.taskSnapshotsByDrone.values()) {
+        const config = snapshot.teamConfiguration;
+        if (!config || !(config.capabilities || []).includes("payload_drop")) {
+          continue;
+        }
+
+        if (config.available === false) {
+          reasons.push(`${snapshot.droneName} unavailable`);
+          continue;
+        }
+
+        const inventory = config.payload_inventory || {};
+        const available = Number(inventory[requestedType] || 0);
+        if (available < requestedQuantity) {
+          reasons.push(`${snapshot.droneName} needs ${requestedQuantity} ${payloadTypeLabel(requestedType)}; ${available} available`);
+          continue;
+        }
+
+        const activeTask = activeTaskForDrone(snapshot.droneId);
+        if (activeTask) {
+          reasons.push(`${snapshot.droneName} busy on ${taskKindLabel(activeTask).toLowerCase()}`);
+        }
+      }
+
+      return reasons.length ? `Waiting — ${reasons.join(" · ")}` : "Waiting — no eligible payload aircraft";
+    }
+
+    function missionSummaryCounts() {
+      const rows = buildAssignmentRows();
+      const supplyContacts = new Set();
+      const isrAircraft = new Set();
+      const approachingAircraft = new Set();
+      const holdingAircraft = new Set();
+
+      for (const row of rows) {
+        if (row.taskType === "payload_drop" && !["cancelled", "infeasible"].includes(row.rawStatus.toLowerCase())) {
+          supplyContacts.add(row.contactRef);
+        }
+
+        if (row.taskType === "isr_observe" && row.assignedDroneId !== null && String(row.rawStatus || "").toLowerCase() === "orbiting") {
+          isrAircraft.add(row.assignedDroneId);
+        }
+
+        if (row.taskType === "payload_drop" && row.assignedDroneId !== null && row.taskState === "Approaching recipient") {
+          approachingAircraft.add(row.assignedDroneId);
+        }
+
+        if (row.taskType === "payload_drop" && row.assignedDroneId !== null && row.taskState === "Holding for visual acquisition") {
+          holdingAircraft.add(row.assignedDroneId);
+        }
+      }
+
+      return {
+        supplyContacts: supplyContacts.size,
+        isrAircraft: isrAircraft.size,
+        approachingAircraft: approachingAircraft.size,
+        holdingAircraft: holdingAircraft.size,
+      };
     }
 
     function buildTeamSummary() {
@@ -2266,19 +3073,28 @@ DASHBOARD_HTML = r"""<!doctype html>
       };
 
       for (const status of state.statuses.values()) {
-        const mode = normalizedExecutionState(status.current_mode || "searching");
+        const mode = String(status.current_mode || "searching").toLowerCase().replaceAll("_", " ");
 
-        if (mode === "orbiting") {
+        if (mode.includes("orbit")) {
           summary.orbiting += 1;
-        } else if (mode === "transitioning") {
+        } else if (
+          mode.includes("transition")
+          || mode.includes("enroute")
+          || mode.includes("respond")
+          || mode === "approaching payload"
+          || mode === "waiting for track"
+          || mode === "awaiting local acquisition"
+        ) {
           summary.transitioning += 1;
-        } else {
+        } else if (mode.includes("search") || mode.includes("patrol")) {
           summary.searching += 1;
         }
       }
 
       for (const row of buildAssignmentRows()) {
-        if (row.taskState === "queued" || row.assignedDroneName === "queued") {
+        const rawStatus = String(row.rawStatus || "").toLowerCase().replaceAll("_", " ");
+
+        if (row.assignedDroneId === null && (rawStatus.includes("queue") || rawStatus === "reported" || rawStatus === "electing")) {
           summary.queued += 1;
         }
       }
@@ -2296,9 +3112,10 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     function arrangeDashboardTabs() {
       document.getElementById("tab-team").appendChild(document.getElementById("map-grid-section"));
-      document.getElementById("tab-team").appendChild(document.getElementById("belief-display-card"));
-      document.getElementById("tab-team").appendChild(document.getElementById("shared-inspector-card"));
       document.getElementById("tab-team").appendChild(document.getElementById("assignment-card"));
+      document.getElementById("tab-team").appendChild(document.getElementById("team-setup-card"));
+      document.getElementById("tab-team").appendChild(document.getElementById("belief-display-card"));
+      document.getElementById("tab-team").appendChild(document.getElementById("belief-sensor-details"));
       document.getElementById("tab-truth").appendChild(document.getElementById("truth-card"));
       document.getElementById("tab-network").appendChild(document.getElementById("network-card"));
     }
@@ -2608,8 +3425,138 @@ DASHBOARD_HTML = r"""<!doctype html>
       `;
     }
 
+    function inventorySummaryFor(droneId) {
+      const status = state.statuses.get(droneId);
+      const snapshot = state.taskSnapshotsByDrone.get(droneId);
+      const config = snapshot && snapshot.teamConfiguration;
+      const carried = config ? Object.entries(config.payload_inventory || {}).sort(([left], [right]) => left.localeCompare(right)).map(([key, value]) => `${key}×${value}`).join("/") || "empty" : "unknown";
+      const available = status && status.diagnostics && status.diagnostics.payload_drop
+        ? Object.entries(status.diagnostics.payload_drop.available_inventory_after_reservations || {}).sort(([left], [right]) => left.localeCompare(right)).map(([key, value]) => `${key}×${value}`).join("/") || "empty"
+        : "unknown";
+      const activePayloadTask = activeTaskForDrone(droneId);
+      const reserved = activePayloadTask && taskTypeFor(activePayloadTask) === "payload_drop"
+        ? `${activePayloadTask.requested_payload_type || "payload"}×${Number(activePayloadTask.reserved_payload_quantity || activePayloadTask.requested_payload_quantity || 0)}`
+        : "none";
+
+      return { carried, available, reserved };
+    }
+
+    function readableActivityForDrone(drone) {
+      const status = state.statuses.get(drone.id);
+      if (!status) {
+        return { activity: "Offline", assignedContact: "—" };
+      }
+
+      const activeTask = activeTaskForDrone(drone.id);
+      const activity = normalizedExecutionState(status.current_mode || "patrol") || "Patrolling";
+      return {
+        activity,
+        assignedContact: activeTask ? taskDisplayName(activeTask) : "—",
+      };
+    }
+
+    function renderAircraftCards() {
+      const container = document.getElementById("aircraft-cards");
+      if (!container) {
+        return;
+      }
+
+      container.innerHTML = drones.map((drone) => {
+        const snapshot = state.taskSnapshotsByDrone.get(drone.id);
+        const config = snapshot && snapshot.teamConfiguration;
+        const { activity, assignedContact } = readableActivityForDrone(drone);
+        const inventory = inventorySummaryFor(drone.id);
+        const isPayloadCapable = config && (config.capabilities || []).includes("payload_drop");
+
+        return `
+          <section class="aircraft-card" style="--drone-color: ${drone.color}">
+            <h3><span class="swatch" style="background: ${drone.color}"></span>${escapeHtml(drone.name)}</h3>
+            <dl class="diagnostics-grid">
+              <dt>Role</dt><dd>${escapeHtml(roleLabelFor(config))}</dd>
+              <dt>Equipment</dt><dd>${escapeHtml(equipmentDescriptionFor(config))}</dd>
+              <dt>Connection</dt><dd>${escapeHtml(snapshot && snapshot.online ? "Connected" : "Offline")}</dd>
+              <dt>Activity</dt><dd>${escapeHtml(activity)}</dd>
+              <dt>Assigned contact</dt><dd>${escapeHtml(assignedContact)}</dd>
+              ${isPayloadCapable ? `
+                <dt>Carried</dt><dd>${escapeHtml(inventory.carried)}</dd>
+                <dt>Reserved</dt><dd>${escapeHtml(inventory.reserved)}</dd>
+                <dt>Available</dt><dd>${escapeHtml(inventory.available)}</dd>
+              ` : ""}
+            </dl>
+          </section>
+        `;
+      }).join("");
+    }
+
+    function renderMissionSummary() {
+      const counts = missionSummaryCounts();
+      document.getElementById("metric-supply-contacts").textContent = counts.supplyContacts;
+      document.getElementById("metric-isr-aircraft").textContent = counts.isrAircraft;
+      document.getElementById("metric-payload-approaching").textContent = counts.approachingAircraft;
+      document.getElementById("metric-payload-holding").textContent = counts.holdingAircraft;
+    }
+
+    function currentAssignmentRunKey() {
+      return String(state.scenarioRunId || "unknown-run");
+    }
+
+    function assignmentRowKey(row) {
+      return `${currentAssignmentRunKey()}:${row.taskId}`;
+    }
+
+    function captureAssignmentDisclosureState(details) {
+      const runKey = currentAssignmentRunKey();
+
+      if (state.assignmentDetailsRunKey !== runKey) {
+        state.assignmentDetailsOpenByKey.clear();
+        state.assignmentDetailsRunKey = runKey;
+      }
+
+      for (const disclosure of details.querySelectorAll("[data-assignment-row-key]")) {
+        state.assignmentDetailsOpenByKey.set(disclosure.getAttribute("data-assignment-row-key"), Boolean(disclosure.open));
+      }
+    }
+
+    function assignmentTableHtml(rows, droneModes) {
+      return `
+        <div>${droneModes}</div>
+        <table class="assignment-table">
+          <thead><tr><th>Contact</th><th>Task</th><th>Aircraft</th><th>Status</th><th>Supplies</th><th>Action</th></tr></thead>
+          <tbody>
+            ${rows.map((row) => {
+              const rowKey = assignmentRowKey(row);
+              return `<tr data-assignment-task-key="${escapeHtml(rowKey)}">
+                <td>
+                  ${escapeHtml(row.contactName)}
+                  <details data-assignment-row-key="${escapeHtml(rowKey)}"${state.assignmentDetailsOpenByKey.get(rowKey) ? " open" : ""}>
+                    <summary>Details</summary>
+                    <dl class="diagnostics-grid">
+                      <dt>Task ID</dt><dd>${escapeHtml(row.taskId.split(":").slice(1).join(":"))}</dd>
+                      <dt>Task type</dt><dd>${escapeHtml(row.taskType)}</dd>
+                      <dt>Raw status</dt><dd>${escapeHtml(row.rawStatus)}</dd>
+                      <dt>Request age</dt><dd>${escapeHtml(row.requestCreatedAge)}</dd>
+                      <dt>Guidance evidence age</dt><dd>${escapeHtml(row.guidanceEvidenceAge)}</dd>
+                      <dt>Owner report age</dt><dd>${escapeHtml(row.ownerReportAge)}</dd>
+                      <dt>Reservation</dt><dd>${escapeHtml(row.reservationDetails)}</dd>
+                      <dt>Provenance</dt><dd>${escapeHtml(row.provenance)}</dd>
+                    </dl>
+                  </details>
+                </td>
+                <td>${escapeHtml(row.taskLabel)}</td>
+                <td>${escapeHtml(row.assignedDroneName)}</td>
+                <td>${escapeHtml(row.taskState)}</td>
+                <td>${escapeHtml(row.payloadRequirement)}</td>
+                <td><button class="task-action" type="button" title="Release only this task, release any payload reservation, and return the assigned aircraft toward patrol. This does not land or return home." data-task-identity="${escapeHtml(row.taskId)}" data-cancel-task-id="${escapeHtml(row.taskId.split(":").slice(1).join(":"))}">${escapeHtml(row.cancelLabel)}</button></td>
+              </tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
     function renderAssignments() {
       const details = document.getElementById("assignment-details");
+      captureAssignmentDisclosureState(details);
       const rows = buildAssignmentRows();
       const droneModes = drones.map((drone) => {
         const status = state.statuses.get(drone.id);
@@ -2636,23 +3583,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         return;
       }
 
-      details.innerHTML = `
-        <div>${droneModes}</div>
-        <table class="assignment-table">
-          <thead><tr><th>Task</th><th>Type</th><th>Assigned drone</th><th>Task state</th><th>Payload / reservation</th><th>Last observation age</th><th>Status report</th></tr></thead>
-          <tbody>
-            ${rows.map((row) => `<tr>
-              <td title="${escapeHtml(row.debugTitle)}">${escapeHtml(row.displayName)}</td>
-              <td>${escapeHtml(row.taskType)}</td>
-              <td>${escapeHtml(row.assignedDroneName)}</td>
-              <td>${escapeHtml(row.taskState)}</td>
-              <td>${escapeHtml(row.payloadRequirement)}</td>
-              <td>${escapeHtml(row.observationAge)}</td>
-              <td>${escapeHtml(row.sourceLabel)}</td>
-            </tr>`).join("")}
-          </tbody>
-        </table>
-      `;
+      details.innerHTML = assignmentTableHtml(rows, droneModes);
     }
 
     function handoffStageFromEvidence() {
@@ -2708,10 +3639,21 @@ DASHBOARD_HTML = r"""<!doctype html>
       return `Accepted tracking evidence from ${[...sourceIds].map(droneNameForId).join(", ")}.`;
     }
 
+    function renderActionErrorBanner() {
+      const banner = document.getElementById("action-error-banner");
+
+      if (!banner) {
+        return;
+      }
+
+      const message = state.scenarioControlError || (state.handoffDemoError ? `Action error: ${state.handoffDemoError}` : "");
+      banner.hidden = !message;
+      banner.textContent = message;
+    }
+
     function renderHandoffDemoFeedback() {
       const feedback = document.getElementById("handoff-demo-feedback");
       const button = document.getElementById("handoff-demo-button");
-      const banner = document.getElementById("action-error-banner");
 
       if (!feedback || !button) {
         return;
@@ -2736,10 +3678,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       button.textContent = finished || state.handoffDemoRunStatus === "finished" ? "Replay handoff demo" : "Run handoff demo";
       button.disabled = state.handoffDemoRunStatus === "configuring";
 
-      if (banner) {
-        banner.hidden = !state.handoffDemoError;
-        banner.textContent = state.handoffDemoError ? `Action error: ${state.handoffDemoError}` : "";
-      }
+      renderActionErrorBanner();
 
       feedback.innerHTML = [
         `Handoff demo seed: <strong>${HANDOFF_DEMO_SEED}</strong>`,
@@ -2754,6 +3693,114 @@ DASHBOARD_HTML = r"""<!doctype html>
         state.handoffDemoError ? `Error: ${escapeHtml(state.handoffDemoError)}` : "",
         handoffEvidenceSummaryHtml(),
       ].filter(Boolean).join(" · ");
+    }
+
+    function selectedScenarioLabel() {
+      const scenarioSelect = document.getElementById("scenario-select");
+      const selectedScenarioOption = scenarioSelect && scenarioSelect.selectedOptions && scenarioSelect.selectedOptions.length
+        ? scenarioSelect.selectedOptions[0]
+        : null;
+      return selectedScenarioOption
+        ? selectedScenarioOption.textContent
+        : state.scenarioName || state.scenarioId || "selected scenario";
+    }
+
+    function runningScenarioLabel() {
+      const option = [...document.getElementById("scenario-select").querySelectorAll("option")]
+        .find((item) => item.value === state.scenarioId);
+      return option ? option.textContent : state.scenarioName || state.scenarioId || "running scenario";
+    }
+
+    function finiteScenarioSeed(value) {
+      const seed = Number(value);
+
+      if (!Number.isInteger(seed) || !Number.isFinite(seed)) {
+        throw new Error(`Invalid scenario seed: ${value}`);
+      }
+
+      return seed;
+    }
+
+    function resolveScenarioSeed() {
+      if (state.appliedRunOptions && state.appliedRunOptions.scenario_seed !== undefined) {
+        return finiteScenarioSeed(state.appliedRunOptions.scenario_seed);
+      }
+
+      if (state.scenarioSeed !== null && state.scenarioSeed !== undefined) {
+        return finiteScenarioSeed(state.scenarioSeed);
+      }
+
+      return finiteScenarioSeed(DEFAULT_SCENARIO_SEED);
+    }
+
+    function selectedRunOptionsForStart() {
+      return {
+        restart_scenario: true,
+        ...selectedRunOptions(),
+        scenario_seed: resolveScenarioSeed(),
+        paused: false,
+        sharing_enabled: true,
+      };
+    }
+
+    async function startScenarioWithPayload(payload, successMessage) {
+      if (state.scenarioStartPending) {
+        return false;
+      }
+
+      try {
+        payload.scenario_seed = finiteScenarioSeed(payload.scenario_seed);
+      } catch (error) {
+        state.scenarioControlStatus = "error";
+        state.scenarioControlMessage = error.message;
+        state.scenarioControlError = error.message;
+        renderActionErrorBanner();
+        renderControls();
+        return false;
+      }
+
+      const mutationId = state.activeScenarioMutationId + 1;
+      state.activeScenarioMutationId = mutationId;
+      state.scenarioStartPending = true;
+      state.scenarioControlStatus = "starting";
+      state.scenarioControlMessage = "Starting scenario and waiting for all nodes to acknowledge the same run.";
+      state.scenarioControlError = "";
+      state.handoffDemoRunStatus = payload.scenario === "moving_person_handoff" ? state.handoffDemoRunStatus : "idle";
+      clearInspectionSelection("Scenario start requested. Previous selected object and pinned sensor report were cleared.");
+      renderControls();
+
+      try {
+        await postControlNoUpdate(payload);
+        await waitForConfigurationAcknowledgement(payload, { label: "scenario", mutationId });
+        if (mutationId !== state.activeScenarioMutationId) {
+          return false;
+        }
+        state.paused = false;
+        state.appliedRunOptions = { ...payload };
+        state.scenarioConfigDirty = false;
+        state.scenarioControlStatus = "running";
+        state.scenarioControlMessage = successMessage || "Scenario running on all nodes.";
+        state.scenarioControlError = "";
+        await updateAll();
+        return true;
+      } catch (error) {
+        if (mutationId !== state.activeScenarioMutationId) {
+          return false;
+        }
+        state.scenarioControlStatus = "error";
+        state.scenarioControlMessage = `Scenario start failed: ${error.message}`;
+        state.scenarioControlError = state.scenarioControlMessage;
+        try {
+          await postControlNoUpdate({ paused: true }, drones);
+        } catch (_pauseError) {
+          // Preserve the original failure while leaving reachable nodes paused where possible.
+        }
+        renderActionErrorBanner();
+        renderControls();
+      } finally {
+        state.scenarioStartPending = false;
+        renderControls();
+      }
     }
 
     function renderControls() {
@@ -2781,14 +3828,17 @@ DASHBOARD_HTML = r"""<!doctype html>
         playbookSelect.value = state.selectedPlaybook;
       }
 
-      document.getElementById("compact-scenario-name").textContent = state.scenarioName;
-      document.getElementById("compact-run-state").textContent = state.handoffDemoRunStatus === "error" || state.handoffConfigStatus === "error"
+      const runState = state.scenarioControlStatus === "error"
         ? "Error"
-        : state.paused
-          ? "Paused"
-          : Number(state.truth.simulation_time || 0) >= HANDOFF_DEMO_SECONDS && state.scenarioId === "moving_person_handoff"
-            ? "Finished"
-            : "Running";
+        : state.scenarioControlStatus === "connecting"
+          ? "Connecting"
+          : state.scenarioStartPending || state.scenarioControlStatus === "starting"
+            ? "Starting"
+            : state.paused
+              ? "Paused"
+              : "Running";
+
+      document.getElementById("compact-run-state").textContent = runState;
       document.getElementById("compact-elapsed-time").textContent = `${Number(state.truth.simulation_time || 0).toFixed(1)} s`;
       document.getElementById("compact-pause-button").textContent = state.paused ? "Resume" : "Pause";
 
@@ -2799,17 +3849,15 @@ DASHBOARD_HTML = r"""<!doctype html>
         document.getElementById("priority-count-select").value = String(state.requestedPriorityCount || 0);
       }
 
-      const scenarioSelect = document.getElementById("scenario-select");
-      const selectedScenarioOption = scenarioSelect.selectedOptions && scenarioSelect.selectedOptions.length
-        ? scenarioSelect.selectedOptions[0]
-        : null;
-      const scenarioLabel = selectedScenarioOption
-        ? selectedScenarioOption.textContent
-        : state.scenarioName || state.scenarioId || "selected scenario";
-      document.getElementById("new-scenario-button").textContent = `New random ${scenarioLabel}`;
+      const scenarioLabel = selectedScenarioLabel();
+      const runningLabel = runningScenarioLabel();
+      const startButton = document.getElementById("start-scenario-button");
+      if (startButton) {
+        startButton.disabled = state.scenarioStartPending;
+        startButton.textContent = state.scenarioStartPending ? "Starting…" : "Start scenario";
+      }
 
-      document.getElementById("sharing-button").textContent = state.sharingEnabled ? "Disable sharing" : "Enable sharing";
-      document.getElementById("pause-button").textContent = state.paused ? "Resume" : "Pause";
+      document.getElementById("sharing-button").textContent = state.sharingEnabled ? "Sharing: On" : "Sharing: Off";
       const teamConfigSummary = drones.map((drone) => {
         const snapshot = state.taskSnapshotsByDrone.get(drone.id);
         const config = snapshot && snapshot.teamConfiguration;
@@ -2820,10 +3868,16 @@ DASHBOARD_HTML = r"""<!doctype html>
           .sort(([left], [right]) => left.localeCompare(right))
           .map(([payloadType, quantity]) => `${payloadType}×${quantity}`);
         const inventory = inventoryEntries.length ? inventoryEntries.join("/") : "empty";
-        return `${drone.name}: ${config.role} · ${config.available ? "available" : "unavailable"} · ${config.capabilities.join("/")} · inventory ${inventory}`;
+        return `${drone.name}: ${roleLabelFor(config)} · ${config.available ? "available" : "unavailable"} · ${config.capabilities.join("/")} · inventory ${inventory}`;
       }).join(" · ");
       document.getElementById("team-config-state").textContent = teamConfigSummary;
+      renderTeamSetup();
+      const selectedDiffers = document.getElementById("scenario-select").value !== state.scenarioId;
+      const scenarioControlMessage = selectedDiffers
+        ? `Selected ${scenarioLabel}; running ${runningLabel}. ${state.scenarioControlMessage}`
+        : `Running ${runningLabel}. ${state.scenarioControlMessage}`;
       document.getElementById("control-state").textContent = `${state.sharingEnabled ? "Sharing on" : "Sharing off"} · ${state.paused ? "paused" : "running"}`;
+      document.getElementById("scenario-control-state").textContent = scenarioControlMessage;
       document.getElementById("scenario-state").textContent = `${state.scenarioName} · seed ${state.scenarioSeed} · run ${state.scenarioRunId || "—"} · priority ${state.priorityObjectCount} · playbook ${state.selectedPlaybook} · payload requests ${state.payloadRequestsEnabled ? `${state.requestedPayloadType}×${state.requestedPayloadQuantity}` : "off"} · build ${state.appBuild}`;
       document.getElementById("task-state").textContent = `${taskSummary.orbiting} orbiting · ${taskSummary.transitioning} transitioning · ${taskSummary.searching} searching · ${taskSummary.queued} queued`;
       document.getElementById("playbook-config-state").textContent = pendingConfig && !applied
@@ -2833,11 +3887,21 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     async function postControlNoUpdate(payload, targetDrones = drones) {
-      await Promise.all(targetDrones.map((drone) => fetchJson(`${drone.url}/control`, {
+      const results = await Promise.allSettled(targetDrones.map((drone) => fetchJson(`${drone.url}/control`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        timeoutMs: 5000,
       })));
+
+      const failures = results
+        .map((result, index) => ({ result, drone: targetDrones[index] }))
+        .filter((item) => item.result.status === "rejected")
+        .map((item) => `${item.drone.name}: ${item.result.reason.message}`);
+
+      if (failures.length) {
+        throw new Error(failures.join(" · "));
+      }
     }
 
     async function postControl(payload, targetDrones = drones) {
@@ -2853,8 +3917,10 @@ DASHBOARD_HTML = r"""<!doctype html>
       }
 
       await Promise.all(drones.map(updateDrone));
+      reconcileScenarioReadiness();
       renderControls();
       renderAssignments();
+      renderMissionSummary();
       renderNetwork();
       renderMaps();
 
@@ -2879,12 +3945,27 @@ DASHBOARD_HTML = r"""<!doctype html>
       postControl({ sharing_enabled: !state.sharingEnabled });
     });
 
-    document.getElementById("pause-button").addEventListener("click", () => {
+    document.getElementById("compact-pause-button").addEventListener("click", () => {
+      state.scenarioControlStatus = state.paused ? "running" : "paused";
+      state.scenarioControlMessage = state.paused ? "Resuming active run." : "Pausing active run.";
       postControl({ paused: !state.paused });
     });
 
-    document.getElementById("compact-pause-button").addEventListener("click", () => {
-      postControl({ paused: !state.paused });
+    document.getElementById("start-scenario-button").addEventListener("click", () => {
+      state.handoffDemoError = "";
+      state.handoffDemoAckMessage = "";
+      state.handoffDemoFinishPauseRequested = false;
+      state.handoffEvidence.clear();
+      state.handoffObjectIdsByDrone.clear();
+
+      try {
+        startScenarioWithPayload(selectedRunOptionsForStart(), "Scenario started on all nodes.");
+      } catch (error) {
+        state.scenarioControlStatus = "error";
+        state.scenarioControlMessage = error.message;
+        state.scenarioControlError = error.message;
+        renderControls();
+      }
     });
 
     document.getElementById("compact-replay-button").addEventListener("click", () => {
@@ -2893,7 +3974,18 @@ DASHBOARD_HTML = r"""<!doctype html>
       state.handoffDemoFinishPauseRequested = false;
       state.handoffEvidence.clear();
       state.handoffObjectIdsByDrone.clear();
-      postControl({ restart_scenario: true, ...selectedRunOptions() });
+
+      try {
+        const payload = state.appliedRunOptions
+          ? { ...state.appliedRunOptions, scenario_seed: finiteScenarioSeed(state.appliedRunOptions.scenario_seed), restart_scenario: true, paused: false, sharing_enabled: state.sharingEnabled }
+          : selectedRunOptionsForStart();
+        startScenarioWithPayload(payload, "Current scenario restarted on all nodes.");
+      } catch (error) {
+        state.scenarioControlStatus = "error";
+        state.scenarioControlMessage = error.message;
+        state.scenarioControlError = error.message;
+        renderControls();
+      }
     });
 
     function selectedRunOptions() {
@@ -2929,23 +4021,104 @@ DASHBOARD_HTML = r"""<!doctype html>
       postControl({ playbook, playbook_config_version: version });
     }
 
-    document.getElementById("reset-button").addEventListener("click", () => {
-      state.handoffDemoError = "";
-      state.handoffDemoAckMessage = "";
-      state.handoffDemoFinishPauseRequested = false;
-      postControl({ restart_scenario: true, ...selectedRunOptions() });
-    });
 
-    document.getElementById("new-scenario-button").addEventListener("click", () => {
-      const scenarioSeed = Math.floor(Date.now() % 1000000000);
-      state.handoffDemoRunStatus = "idle";
-      state.handoffDemoError = "";
-      state.handoffDemoAckMessage = "";
-      state.handoffDemoFinishPauseRequested = false;
-      postControl({ scenario_seed: scenarioSeed, ...selectedRunOptions() });
-    });
+    function formatDiagnosticValue(value) {
+      return value === undefined ? "missing" : JSON.stringify(value);
+    }
 
-    function configurationMismatch(payload, expected) {
+    function hasOwnField(value, field) {
+      return Boolean(value && Object.prototype.hasOwnProperty.call(value, field));
+    }
+
+    function memberConfigurationMismatch(actual, expected) {
+      if (!expected || typeof expected !== "object") {
+        return `team_configuration expected present, actual ${formatDiagnosticValue(actual)}`;
+      }
+
+      if (!actual || typeof actual !== "object") {
+        return `team_configuration expected ${formatDiagnosticValue(expected)}, actual missing`;
+      }
+
+      for (const field of ["role", "camera_mount", "available"]) {
+        if (!hasOwnField(actual, field)) {
+          return `${field} expected ${formatDiagnosticValue(expected[field])}, actual missing`;
+        }
+
+        if (!hasOwnField(expected, field)) {
+          return `${field} expected missing, actual ${formatDiagnosticValue(actual[field])}`;
+        }
+
+        const actualValue = field === "available" ? Boolean(actual[field]) : actual[field];
+        const expectedValue = field === "available" ? Boolean(expected[field]) : expected[field];
+
+        if (actualValue !== expectedValue) {
+          return `${field} expected ${formatDiagnosticValue(expectedValue)}, actual ${formatDiagnosticValue(actualValue)}`;
+        }
+      }
+
+      if (!Array.isArray(expected.capabilities)) {
+        return `capabilities expected ${formatDiagnosticValue(expected.capabilities)}, actual ${formatDiagnosticValue(actual.capabilities)}`;
+      }
+
+      if (!Array.isArray(actual.capabilities)) {
+        return `capabilities expected ${formatDiagnosticValue(expected.capabilities)}, actual ${formatDiagnosticValue(actual.capabilities)}`;
+      }
+
+      const expectedCapabilities = [...new Set(expected.capabilities)].sort();
+      const actualCapabilities = [...new Set(actual.capabilities)].sort();
+
+      if (expectedCapabilities.length !== actualCapabilities.length) {
+        return `capabilities expected ${formatDiagnosticValue(expectedCapabilities)}, actual ${formatDiagnosticValue(actualCapabilities)}`;
+      }
+
+      for (let index = 0; index < expectedCapabilities.length; index += 1) {
+        if (expectedCapabilities[index] !== actualCapabilities[index]) {
+          return `capabilities expected ${formatDiagnosticValue(expectedCapabilities)}, actual ${formatDiagnosticValue(actualCapabilities)}`;
+        }
+      }
+
+      if (!hasOwnField(expected, "payload_inventory")) {
+        return `payload_inventory expected missing, actual ${formatDiagnosticValue(actual.payload_inventory)}`;
+      }
+
+      if (!hasOwnField(actual, "payload_inventory")) {
+        return `payload_inventory expected ${formatDiagnosticValue(expected.payload_inventory)}, actual missing`;
+      }
+
+      const expectedInventory = expected.payload_inventory;
+      const actualInventory = actual.payload_inventory;
+
+      if (!expectedInventory || typeof expectedInventory !== "object" || Array.isArray(expectedInventory)) {
+        return `payload_inventory expected ${formatDiagnosticValue(expectedInventory)}, actual ${formatDiagnosticValue(actualInventory)}`;
+      }
+
+      if (!actualInventory || typeof actualInventory !== "object" || Array.isArray(actualInventory)) {
+        return `payload_inventory expected ${formatDiagnosticValue(expectedInventory)}, actual ${formatDiagnosticValue(actualInventory)}`;
+      }
+
+      const inventoryKeys = [...new Set([...Object.keys(expectedInventory), ...Object.keys(actualInventory)])].sort();
+
+      for (const key of inventoryKeys) {
+        if (!hasOwnField(expectedInventory, key)) {
+          return `payload_inventory.${key} expected missing, actual ${formatDiagnosticValue(actualInventory[key])}`;
+        }
+
+        if (!hasOwnField(actualInventory, key)) {
+          return `payload_inventory.${key} expected ${formatDiagnosticValue(expectedInventory[key])}, actual missing`;
+        }
+
+        const expectedQuantity = Number(expectedInventory[key]);
+        const actualQuantity = Number(actualInventory[key]);
+
+        if (expectedQuantity !== actualQuantity) {
+          return `payload_inventory.${key} expected ${expectedQuantity}, actual ${actualQuantity}`;
+        }
+      }
+
+      return "";
+    }
+
+    function configurationMismatch(payload, expected, droneId) {
       const expectedScenario = expected.scenario_id || expected.scenario;
       const checks = [
         [Number(payload.scenario_seed) === Number(expected.scenario_seed), `seed ${payload.scenario_seed}`],
@@ -2957,18 +4130,43 @@ DASHBOARD_HTML = r"""<!doctype html>
         [Boolean(payload.sharing_enabled) === Boolean(expected.sharing_enabled), `sharing ${payload.sharing_enabled}`],
         [Boolean(payload.paused) === Boolean(expected.paused), `paused ${payload.paused}`],
       ];
-      return checks.filter(([passed]) => !passed).map(([_passed, label]) => label).join(", ");
+
+      const topLevelMismatch = checks.filter(([passed]) => !passed).map(([_passed, label]) => label).join(", ");
+
+      if (topLevelMismatch) {
+        return topLevelMismatch;
+      }
+
+      if (expected.team_configuration) {
+        return memberConfigurationMismatch(
+          payload.team_configuration,
+          expected.team_configuration[String(droneId)],
+        );
+      }
+
+      return "";
     }
 
-    async function waitForConfigurationAcknowledgement(expected) {
-      const deadline = Date.now() + 8000;
+    async function waitForConfigurationAcknowledgement(expected, options = {}) {
+      const deadline = Date.now() + Number(options.timeoutMs || 8000);
+      const mutationId = options.mutationId || state.activeScenarioMutationId;
+      const label = options.label || "scenario";
       let lastMessage = "Waiting for node acknowledgements.";
 
       while (Date.now() < deadline) {
+        if (mutationId !== state.activeScenarioMutationId) {
+          throw new Error("Superseded by a newer scenario request.");
+        }
         const results = await Promise.all(drones.map(async (drone) => {
           try {
             const payload = await fetchJson(`${drone.url}/control`);
-            const mismatch = configurationMismatch(payload, expected);
+
+            if (expected.team_configuration) {
+              const status = await fetchJson(`${drone.url}/status`);
+              payload.team_configuration = status.team_configuration || null;
+            }
+
+            const mismatch = configurationMismatch(payload, expected, drone.id);
             return mismatch ? `${drone.name}: ${mismatch}` : "";
           } catch (error) {
             return `${drone.name}: unavailable`;
@@ -2977,14 +4175,24 @@ DASHBOARD_HTML = r"""<!doctype html>
         const failures = results.filter(Boolean);
 
         if (failures.length === 0) {
-          state.handoffConfigStatus = "verified";
-          state.handoffDemoAckMessage = "All nodes acknowledged handoff demo configuration.";
+          if (label === "handoff demo") {
+            state.handoffConfigStatus = "verified";
+            state.handoffDemoAckMessage = "All nodes acknowledged handoff demo configuration.";
+          } else {
+            state.scenarioControlStatus = "running";
+            state.scenarioControlMessage = "All nodes acknowledged the active scenario.";
+          }
           renderControls();
           return;
         }
 
-        lastMessage = `Configuring handoff demo · ${failures.join(" · ")}`;
-        state.handoffDemoAckMessage = lastMessage;
+        lastMessage = `Configuring ${label} · ${failures.join(" · ")}`;
+        if (label === "handoff demo") {
+          state.handoffDemoAckMessage = lastMessage;
+        } else {
+          state.scenarioControlStatus = "starting";
+          state.scenarioControlMessage = lastMessage;
+        }
         renderControls();
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
@@ -3034,7 +4242,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
       try {
         await postControlNoUpdate(payload);
-        await waitForConfigurationAcknowledgement(payload);
+        await waitForConfigurationAcknowledgement(payload, { label: "handoff demo" });
         await postControlNoUpdate({ paused: false, sharing_enabled: true });
         state.handoffDemoRunStatus = "running";
         state.handoffConfigStatus = "verified";
@@ -3053,6 +4261,10 @@ DASHBOARD_HTML = r"""<!doctype html>
       runHandoffDemo();
     });
 
+    document.getElementById("apply-team-restart-button").addEventListener("click", () => {
+      applyTeamAndRestart();
+    });
+
     document.getElementById("playbook-select").addEventListener("change", (event) => {
       state.playbookSelectDirty = true;
       applyPlaybookConfiguration(event.target.value);
@@ -3064,9 +4276,6 @@ DASHBOARD_HTML = r"""<!doctype html>
       });
     }
 
-    document.getElementById("cancel-response-button").addEventListener("click", () => {
-      postControl({ cancel_response: true });
-    });
 
     document.getElementById("trail-toggle").addEventListener("change", (event) => {
       state.showFlightTrails = event.target.checked;
@@ -3106,6 +4315,18 @@ DASHBOARD_HTML = r"""<!doctype html>
     document.addEventListener("toggle", (event) => {
       if (event.target && event.target.id === "observation-json-details") {
         state.rawJsonOpen = Boolean(event.target.open);
+      }
+
+      if (event.target && event.target.getAttribute && event.target.getAttribute("data-assignment-row-key")) {
+        const rowKey = event.target.getAttribute("data-assignment-row-key");
+        const runKey = currentAssignmentRunKey();
+
+        if (state.assignmentDetailsRunKey !== runKey) {
+          state.assignmentDetailsOpenByKey.clear();
+          state.assignmentDetailsRunKey = runKey;
+        }
+
+        state.assignmentDetailsOpenByKey.set(rowKey, Boolean(event.target.open));
       }
     }, true);
 
@@ -3157,6 +4378,11 @@ DASHBOARD_HTML = r"""<!doctype html>
       const copyButton = event.target.closest("[data-copy-observation-json]");
       if (copyButton && state.selectedObservationSnapshot) {
         navigator.clipboard.writeText(state.selectedObservationSnapshot.rawJson);
+      }
+
+      const cancelTaskButton = event.target.closest("[data-cancel-task-id]");
+      if (cancelTaskButton) {
+        postControl({ cancel_response: true, cancel_response_task_id: cancelTaskButton.getAttribute("data-cancel-task-id") });
       }
     });
 
@@ -3240,6 +4466,7 @@ class DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
     """Serve the browser dashboard."""
 
     drones: list[dict[str, str | int]] = []
+    team_config_path: Path = DEFAULT_LOCAL_TEAM_CONFIG_PATH
 
     def do_GET(self) -> None:
         if self.path not in {"/", "/index.html"}:
@@ -3255,6 +4482,31 @@ class DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def do_POST(self) -> None:
+        if self.path != "/team-config":
+            self.send_error(404)
+            return
+
+        content_length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(content_length)
+
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+            validated = TeamConfiguration.from_mapping(payload, tuple(int(spec["id"]) for spec in DRONE_SPECS)).to_dict()
+        except (json.JSONDecodeError, TeamConfigurationError) as error:
+            self.send_error(400, str(error))
+            return
+
+        self.team_config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.team_config_path.write_text(json.dumps(validated, indent=2, sort_keys=True), encoding="utf-8")
+        response = json.dumps({"saved": True, "path": str(self.team_config_path), "team_configuration": validated}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -3301,7 +4553,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scenario",
-        choices=(DEFAULT_SCENARIO_ID, MOVING_HANDOFF_SCENARIO_ID),
+        choices=(DEFAULT_SCENARIO_ID, MOVING_HANDOFF_SCENARIO_ID, SAR_SUPPLY_SCENARIO_ID),
         default=DEFAULT_SCENARIO_ID,
         help="Scenario geometry. Moving handoff is a shared-world tracking scenario, not a playbook.",
     )
@@ -3441,8 +4693,10 @@ def run_dashboard(
     dashboard_host: str,
     dashboard_port: int,
     drones: list[dict[str, str | int]],
+    team_config_path: Path = DEFAULT_LOCAL_TEAM_CONFIG_PATH,
 ) -> ThreadingTCPServer:
     DashboardRequestHandler.drones = drones
+    DashboardRequestHandler.team_config_path = team_config_path
     server = ThreadingTCPServer((dashboard_host, dashboard_port), DashboardRequestHandler)
     thread = threading.Thread(target=server.serve_forever, name="dashboard-server", daemon=True)
     thread.start()
@@ -3463,7 +4717,13 @@ def main() -> int:
         for spec, port in zip(DRONE_SPECS, drone_ports, strict=True)
     ]
 
-    team_config_path = Path(args.team_config).expanduser().resolve() if args.team_config else None
+    team_config_path = (
+        Path(args.team_config).expanduser().resolve()
+        if args.team_config
+        else DEFAULT_LOCAL_TEAM_CONFIG_PATH
+        if DEFAULT_LOCAL_TEAM_CONFIG_PATH.exists()
+        else None
+    )
 
     print(f"Launcher path: {Path(__file__).resolve()}")
     print(f"Interpreter path: {sys.executable}")
@@ -3512,7 +4772,7 @@ def main() -> int:
             if process.poll() is not None:
                 raise RuntimeError(f"Drone process on port {port} exited unexpectedly.")
 
-        dashboard = run_dashboard(args.dashboard_host, args.dashboard_port, drones)
+        dashboard = run_dashboard(args.dashboard_host, args.dashboard_port, drones, team_config_path or DEFAULT_LOCAL_TEAM_CONFIG_PATH)
         dashboard_url = f"http://{args.dashboard_host}:{args.dashboard_port}"
 
         print(f"Dashboard running at {dashboard_url}")

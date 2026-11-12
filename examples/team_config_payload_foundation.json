@@ -1,26 +1,33 @@
 {
   "1": {
-    "role": "isr",
-    "capabilities": ["atr_observe", "isr_observe"],
     "available": true,
+    "camera_mount": "steerable",
+    "capabilities": [
+      "atr_observe",
+      "isr_observe"
+    ],
     "payload_inventory": {},
-    "camera_mount": "steerable"
+    "role": "isr"
   },
   "2": {
-    "role": "isr",
-    "capabilities": ["atr_observe", "isr_observe"],
     "available": true,
+    "camera_mount": "steerable",
+    "capabilities": [
+      "atr_observe",
+      "isr_observe"
+    ],
     "payload_inventory": {},
-    "camera_mount": "steerable"
+    "role": "isr"
   },
   "3": {
-    "role": "payload",
-    "capabilities": ["atr_observe", "payload_drop"],
     "available": true,
+    "camera_mount": "fixed",
+    "capabilities": [
+      "payload_drop"
+    ],
     "payload_inventory": {
-      "water": 2,
-      "medical_supplies": 1
+      "water": 2
     },
-    "camera_mount": "fixed"
+    "role": "payload"
   }
 }

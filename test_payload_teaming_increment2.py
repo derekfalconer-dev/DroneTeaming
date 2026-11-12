@@ -21,6 +21,7 @@ from simulated_drone import (
     PLAYBOOK_OBSERVE_ORBIT,
     TASK_TYPE_ISR_OBSERVE,
     TASK_TYPE_PAYLOAD_DROP,
+    SAR_SUPPLY_SCENARIO_ID,
     DroneSimulator,
     TeamMemberConfiguration,
     Observation,
@@ -102,7 +103,14 @@ def close_process_pipes(processes: list[subprocess.Popen[str]]) -> None:
                 pipe.close()
 
 
-def team_config(*, red_payload: int = 0, blue_payload: int = 1, green_payload: int = 0, blue_available: bool = True):
+def team_config(
+    *,
+    red_payload: int = 0,
+    blue_payload: int = 1,
+    green_payload: int = 0,
+    blue_available: bool = True,
+    payload_type: str = "rescue_kit",
+):
     return {
         1: TeamMemberConfiguration(
             role="isr",
@@ -114,17 +122,50 @@ def team_config(*, red_payload: int = 0, blue_payload: int = 1, green_payload: i
             role="payload",
             capabilities=("payload_drop",),
             available=blue_available,
-            payload_inventory={"rescue_kit": blue_payload},
+            payload_inventory={payload_type: blue_payload},
             camera_mount="fixed",
         ),
         3: TeamMemberConfiguration(
-            role="generalist",
+            role="payload",
             capabilities=("atr_observe", "isr_observe", "payload_drop"),
             available=True,
-            payload_inventory={"rescue_kit": green_payload},
+            payload_inventory={payload_type: green_payload},
             camera_mount="steerable",
         ),
     }
+
+
+def sar_assistance_observation(
+    *,
+    observation_id: str,
+    source_drone_id: int = 1,
+    source_drone_name: str = "Red",
+    signature_id: str = "sar-contact",
+    payload_type: str = "water",
+    quantity: int = 2,
+    east_m: float = 20.0,
+    north_m: float = 30.0,
+    timestamp: float = 1.0,
+    scenario_run_id: str = "payload-run",
+) -> Observation:
+    observation = priority_observation(
+        observation_id=observation_id,
+        source_drone_id=source_drone_id,
+        source_drone_name=source_drone_name,
+        signature_id=signature_id,
+        east_m=east_m,
+        north_m=north_m,
+        timestamp=timestamp,
+        scenario_run_id=scenario_run_id,
+    )
+    evidence = dict(observation.priority_evidence or {})
+    evidence["assistance_request"] = {
+        "requested_payload_type": payload_type,
+        "requested_payload_quantity": quantity,
+        "evidence_type": "mocked_visible_supply_need_marker",
+        "confidence": 0.93,
+    }
+    return Observation(**{**asdict(observation), "priority_evidence": evidence})
 
 
 def priority_observation(
@@ -674,6 +715,205 @@ class PayloadTeamingIncrement2Test(unittest.TestCase):
         self.assertEqual(1, len(isr))
         self.assertEqual(payload[0]["contact_ref"], isr[0]["contact_ref"])
         self.assertNotEqual(payload[0]["task_id"], isr[0]["task_id"])
+
+    def test_sar_payload_request_requires_explicit_assistance_evidence(self) -> None:
+        simulator = DroneSimulator(
+            1,
+            "Red",
+            [],
+            DEFAULT_SCENARIO_SEED,
+            1,
+            PLAYBOOK_OBSERVE_ORBIT,
+            scenario_id=SAR_SUPPLY_SCENARIO_ID,
+            scenario_run_id="payload-run",
+            team_configuration=team_config(),
+            payload_requests_enabled=True,
+        )
+
+        simulator.receive_observation(asdict(priority_observation(observation_id="priority-non-recipient")))
+        self.assertEqual([], payload_tasks(simulator))
+
+        simulator.receive_observation(asdict(sar_assistance_observation(observation_id="sar-recipient", payload_type="water", quantity=2)))
+        payload = payload_tasks(simulator)
+        self.assertEqual(1, len(payload))
+        self.assertEqual("water", payload[0]["requested_payload_type"])
+        self.assertEqual(2, payload[0]["requested_payload_quantity"])
+        self.assertIn("assistance_request_evidence", payload[0])
+
+    def test_legacy_priority_payload_request_behavior_preserved(self) -> None:
+        simulator = DroneSimulator(
+            1,
+            "Red",
+            [],
+            DEFAULT_SCENARIO_SEED,
+            1,
+            PLAYBOOK_OBSERVE_ORBIT,
+            scenario_run_id="payload-run",
+            team_configuration=team_config(),
+            payload_requests_enabled=True,
+        )
+
+        simulator.receive_observation(asdict(priority_observation(observation_id="legacy-priority")))
+        payload = payload_tasks(simulator)
+        self.assertEqual(1, len(payload))
+        self.assertEqual(DEFAULT_PAYLOAD_TYPE, payload[0]["requested_payload_type"])
+
+    def test_serialized_peer_dispatch_green_wins_moves_holds_blocks_and_cleans_up(self) -> None:
+        publisher = DroneSimulator(
+            1,
+            "Red",
+            [],
+            DEFAULT_SCENARIO_SEED,
+            1,
+            PLAYBOOK_OBSERVE_ORBIT,
+            scenario_run_id="payload-run",
+            team_configuration=team_config(blue_payload=0, green_payload=2, payload_type="water"),
+            payload_requests_enabled=True,
+        )
+        green = DroneSimulator(
+            3,
+            "Green",
+            [],
+            DEFAULT_SCENARIO_SEED,
+            1,
+            PLAYBOOK_OBSERVE_ORBIT,
+            scenario_run_id="payload-run",
+            team_configuration=team_config(blue_payload=0, green_payload=2, payload_type="water"),
+            payload_requests_enabled=True,
+            payload_standoff_m=25.0,
+        )
+        insufficient = DroneSimulator(
+            3,
+            "Green",
+            [],
+            DEFAULT_SCENARIO_SEED,
+            1,
+            PLAYBOOK_OBSERVE_ORBIT,
+            scenario_run_id="payload-run",
+            team_configuration=team_config(blue_payload=0, green_payload=1, payload_type="water"),
+            payload_requests_enabled=True,
+        )
+
+        observation = sar_assistance_observation(
+            observation_id="serialized-sar-water",
+            payload_type="water",
+            quantity=2,
+            east_m=28.0,
+            north_m=36.0,
+        )
+        self.assertTrue(publisher.receive_observation(asdict(observation)))
+        self.assertTrue(green.receive_observation(asdict(observation)))
+        self.assertTrue(insufficient.receive_observation(asdict(observation)))
+
+        outbound = publisher.pop_outbound_claims()
+        payload_message = next(message for message in outbound if message["task_type"] == TASK_TYPE_PAYLOAD_DROP)
+        isr_message = next(message for message in outbound if message["task_type"] == TASK_TYPE_ISR_OBSERVE)
+
+        self.assertTrue(green.receive_claim(payload_message))
+        self.assertTrue(insufficient.receive_claim(payload_message))
+        self.assertTrue(green.receive_claim(isr_message))
+        green.set_simulation_time(2.0)
+        insufficient.set_simulation_time(2.0)
+        green.status()
+        insufficient.status()
+
+        green_payload = payload_tasks(green)[0]
+        task_id = str(green_payload["task_id"])
+        self.assertEqual("Green", green_payload["assigned_drone_name"])
+        self.assertIn(green_payload["status"], {"approaching_payload", "awaiting_local_acquisition"})
+        self.assertEqual(2, green.control_payload()["payload_reservations"][task_id]["quantity"])
+        self.assertEqual({"water": 2}, green.team_configuration.payload_inventory)
+        self.assertLessEqual(sum(int(item["quantity"]) for item in green.control_payload()["payload_reservations"].values()), 2)
+        self.assertEqual(task_id, green.active_response_task_id)
+
+        before = distance_to_estimate(green, green.response_tasks[task_id])
+        green._update_payload_guidance_locked(1.0)
+        after = distance_to_estimate(green, green.response_tasks[task_id])
+        self.assertLess(after, before)
+
+        green.response_east_m = float(green.response_tasks[task_id]["estimated_east_m"]) - 26.0
+        green.response_north_m = float(green.response_tasks[task_id]["estimated_north_m"])
+        green._update_payload_guidance_locked(10.0)
+        self.assertEqual("awaiting_local_acquisition", green.response_tasks[task_id]["status"])
+        self.assertAlmostEqual(25.0, distance_to_estimate(green, green.response_tasks[task_id]), places=6)
+
+        insufficient_payload = payload_tasks(insufficient)[0]
+        self.assertNotIn(insufficient_payload["status"], {"approaching_payload", "awaiting_local_acquisition"})
+        self.assertEqual({}, insufficient.control_payload()["payload_reservations"])
+
+        isr = isr_tasks(publisher)
+        self.assertEqual(1, len(isr))
+        self.assertIn(isr[0]["status"], {"electing", "transitioning", "orbiting", "assigned_remote"})
+
+        green.cancel_response(task_id)
+        self.assertEqual({}, green.control_payload()["payload_reservations"])
+        self.assertIsNone(green.active_response_task_id)
+
+        green.receive_claim(payload_message)
+        green.set_simulation_time(3.0)
+        green.status()
+        self.assertLessEqual(sum(int(item["quantity"]) for item in green.control_payload()["payload_reservations"].values()), 2)
+
+        green.reset(scenario_run_id="payload-run-reset")
+        self.assertEqual({}, green.control_payload()["payload_reservations"])
+
+    def test_guidance_evidence_age_advances_only_with_accepted_contact_evidence(self) -> None:
+        owner = elect_payload_task_with_local_estimate()
+        task_id = owner.active_response_task_id or ""
+        self.assertTrue(task_id)
+
+        peer = DroneSimulator(
+            3,
+            "Green",
+            [],
+            DEFAULT_SCENARIO_SEED,
+            1,
+            PLAYBOOK_OBSERVE_ORBIT,
+            scenario_run_id="payload-run",
+            team_configuration=team_config(blue_payload=1),
+            payload_requests_enabled=True,
+        )
+
+        clock = [owner.last_wall_time]
+        with patch("simulated_drone.time.monotonic", lambda: clock[0]):
+            owner._update_payload_guidance_locked(0.1)
+            first_evidence_at = float(owner.response_tasks[task_id]["guidance_evidence_at"])
+            heartbeat = owner._task_claim_payload_locked(
+                owner.response_tasks[task_id],
+                str(owner.response_tasks[task_id]["status"]),
+            )
+
+            self.assertTrue(peer.receive_claim(heartbeat))
+            self.assertEqual(first_evidence_at, float(peer.response_tasks[task_id]["guidance_evidence_at"]))
+
+            stale_heartbeat = dict(heartbeat)
+            stale_heartbeat["revision"] = max(0, int(stale_heartbeat["revision"]) - 1)
+            self.assertFalse(peer.receive_claim(stale_heartbeat))
+
+            conflicting_heartbeat = dict(heartbeat)
+            conflicting_heartbeat["revision"] = int(conflicting_heartbeat["revision"]) + 1
+            conflicting_heartbeat["requested_payload_type"] = "water"
+            self.assertFalse(peer.receive_claim(conflicting_heartbeat))
+            self.assertTrue(peer.response_tasks[task_id].get("metadata_conflict"))
+
+            first_evidence_age = owner.simulation_time - first_evidence_at
+            clock[0] += 5.0
+            owner.status()
+            owner._update_payload_guidance_locked(0.1)
+            second_evidence_at = float(owner.response_tasks[task_id]["guidance_evidence_at"])
+            second_evidence_age = owner.simulation_time - second_evidence_at
+
+            self.assertEqual(first_evidence_at, second_evidence_at)
+            self.assertGreater(second_evidence_age, first_evidence_age)
+
+            self.assertTrue(owner.receive_observation(asdict(priority_observation(
+                observation_id="fresh-guidance-evidence",
+                east_m=24.0,
+                north_m=32.0,
+                timestamp=first_evidence_at + 10.0,
+            ))))
+            owner._update_payload_guidance_locked(0.1)
+            self.assertGreater(float(owner.response_tasks[task_id]["guidance_evidence_at"]), first_evidence_at)
 
     def test_real_http_heterogeneous_payload_allocation_and_approach(self) -> None:
         ports = [free_port(), free_port(), free_port()]

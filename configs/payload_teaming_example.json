@@ -16,7 +16,7 @@
     "camera_mount": "steerable"
   },
   "3": {
-    "role": "generalist",
+    "role": "payload",
     "capabilities": ["atr_observe", "isr_observe", "payload_drop"],
     "available": true,
     "payload_inventory": {

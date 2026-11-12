@@ -23,7 +23,7 @@ class TeamConfigurationTest(unittest.TestCase):
         config = load_team_configuration(None, tuple(sorted(DRONE_PROFILES)))
         payload = config.to_dict()
 
-        self.assertEqual("generalist", payload["1"]["role"])
+        self.assertEqual("isr", payload["1"]["role"])
         self.assertIn("isr_observe", payload["1"]["capabilities"])
         payload["1"]["payload_inventory"]["water"] = 99
         self.assertEqual({}, config.to_dict()["1"]["payload_inventory"])
@@ -32,6 +32,7 @@ class TeamConfigurationTest(unittest.TestCase):
         cases = [
             '{"4": {"role": "isr", "capabilities": ["isr_observe"], "available": true, "payload_inventory": {}, "camera_mount": "steerable"}}',
             '{"1": {"role": "pilot", "capabilities": ["isr_observe"], "available": true, "payload_inventory": {}, "camera_mount": "steerable"}}',
+            '{"1": {"role": "generalist", "capabilities": ["isr_observe", "payload_drop"], "available": true, "payload_inventory": {"water": 1}, "camera_mount": "steerable"}}',
             '{"1": {"role": "isr", "capabilities": ["warp"], "available": true, "payload_inventory": {}, "camera_mount": "steerable"}}',
             '{"1": {"role": "isr", "capabilities": ["isr_observe"], "available": "yes", "payload_inventory": {}, "camera_mount": "steerable"}}',
             '{"1": {"role": "payload", "capabilities": ["payload_drop"], "available": true, "payload_inventory": {"water": -1}, "camera_mount": "fixed"}}',
