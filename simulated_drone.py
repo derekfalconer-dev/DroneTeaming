@@ -3819,20 +3819,33 @@ class DroneSimulator:
         delta_north = target_north_m - self.response_north_m
         distance = math.hypot(delta_east, delta_north)
         stand_off_m = float(task.get("payload_standoff_m", self.payload_standoff_m))
+        stand_off_tolerance_m = 1e-6
 
-        if distance <= stand_off_m:
-            self.response_camera_yaw_deg = math.degrees(math.atan2(delta_east, delta_north)) % 360.0 if distance > 0.0 else self.response_heading_deg
+        def update_task_estimate(resulting_distance: float) -> None:
+            task["updated_at"] = self.simulation_time
+            task["estimated_east_m"] = target_east_m
+            task["estimated_north_m"] = target_north_m
+            task["estimated_latitude"] = float(estimate["latitude"])
+            task["estimated_longitude"] = float(estimate["longitude"])
+            task["range_to_contact_estimate_m"] = resulting_distance
+
+        def hold_at_standoff(resulting_distance: float) -> None:
+            self.response_camera_yaw_deg = (
+                math.degrees(math.atan2(target_east_m - self.response_east_m, target_north_m - self.response_north_m)) % 360.0
+                if resulting_distance > 0.0
+                else self.response_heading_deg
+            )
             if task["status"] != PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS:
                 task["status"] = PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS
                 task["owner_task_state"] = PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS
                 task["event"] = "Payload drone is holding at stand-off awaiting local acquisition; no release or delivery is claimed."
                 self.outbound_claims.append(self._task_claim_payload_locked(task, PAYLOAD_AWAITING_LOCAL_ACQUISITION_STATUS))
                 task["last_state_broadcast_at"] = self.simulation_time
-            task["updated_at"] = self.simulation_time
-            task["estimated_east_m"] = target_east_m
-            task["estimated_north_m"] = target_north_m
-            task["estimated_latitude"] = float(estimate["latitude"])
-            task["estimated_longitude"] = float(estimate["longitude"])
+
+            update_task_estimate(resulting_distance)
+
+        if distance <= stand_off_m + stand_off_tolerance_m:
+            hold_at_standoff(distance)
             return
 
         max_distance = MAX_RESPONSE_SPEED_MPS * elapsed_seconds
@@ -3842,13 +3855,24 @@ class DroneSimulator:
             self.response_east_m += delta_east * scale
             self.response_north_m += delta_north * scale
 
+        remaining_delta_east = target_east_m - self.response_east_m
+        remaining_delta_north = target_north_m - self.response_north_m
+        remaining_distance = math.hypot(remaining_delta_east, remaining_delta_north)
         desired_heading = math.degrees(math.atan2(delta_east, delta_north)) % 360.0
         self.response_heading_deg = move_angle_toward(
             self.response_heading_deg,
             desired_heading,
             MAX_RESPONSE_TURN_RATE_DEG_PER_SECOND * elapsed_seconds,
         )
-        self.response_camera_yaw_deg = desired_heading
+        self.response_camera_yaw_deg = (
+            math.degrees(math.atan2(remaining_delta_east, remaining_delta_north)) % 360.0
+            if remaining_distance > 0.0
+            else desired_heading
+        )
+
+        if remaining_distance <= stand_off_m + stand_off_tolerance_m:
+            hold_at_standoff(remaining_distance)
+            return
 
         if task["status"] != PAYLOAD_APPROACHING_STATUS:
             task["status"] = PAYLOAD_APPROACHING_STATUS
@@ -3857,12 +3881,7 @@ class DroneSimulator:
             self.outbound_claims.append(self._task_claim_payload_locked(task, PAYLOAD_APPROACHING_STATUS))
             task["last_state_broadcast_at"] = self.simulation_time
 
-        task["updated_at"] = self.simulation_time
-        task["estimated_east_m"] = target_east_m
-        task["estimated_north_m"] = target_north_m
-        task["estimated_latitude"] = float(estimate["latitude"])
-        task["estimated_longitude"] = float(estimate["longitude"])
-        task["range_to_contact_estimate_m"] = distance
+        update_task_estimate(remaining_distance)
 
     def _update_response_guidance_locked(self, elapsed_seconds: float) -> None:
         if not self._has_local_response_control_locked() or elapsed_seconds <= 0.0:

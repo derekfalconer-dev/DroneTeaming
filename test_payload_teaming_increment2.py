@@ -470,12 +470,17 @@ class PayloadTeamingIncrement2Test(unittest.TestCase):
         simulator.response_north_m = float(task["estimated_north_m"])
         simulator._update_payload_guidance_locked(10.0)
         held_distance = distance_to_estimate(simulator, simulator.response_tasks[str(task["task_id"])])
+        held_position = (simulator.response_east_m, simulator.response_north_m)
         self.assertGreaterEqual(held_distance, 29.99)
         self.assertLessEqual(held_distance, 30.01)
 
         payload_task = payload_tasks(simulator)[0]
-        self.assertIn(payload_task["status"], {"approaching_payload", "awaiting_local_acquisition"})
+        self.assertEqual("awaiting_local_acquisition", payload_task["status"])
         self.assertNotIn("delivered", payload_task["event"].lower())
+
+        simulator._update_payload_guidance_locked(1.0)
+        self.assertEqual(held_position, (simulator.response_east_m, simulator.response_north_m))
+        self.assertEqual("awaiting_local_acquisition", payload_tasks(simulator)[0]["status"])
 
     def test_payload_guidance_tracks_moving_estimate_lost_hold_and_recovery(self) -> None:
         simulator = elect_payload_task_with_local_estimate(
@@ -809,13 +814,18 @@ class PayloadTeamingIncrement2Test(unittest.TestCase):
         payload_message = next(message for message in outbound if message["task_type"] == TASK_TYPE_PAYLOAD_DROP)
         isr_message = next(message for message in outbound if message["task_type"] == TASK_TYPE_ISR_OBSERVE)
 
-        self.assertTrue(green.receive_claim(payload_message))
-        self.assertTrue(insufficient.receive_claim(payload_message))
-        self.assertTrue(green.receive_claim(isr_message))
-        green.set_simulation_time(2.0)
-        insufficient.set_simulation_time(2.0)
-        green.status()
-        insufficient.status()
+        clock = [green.last_wall_time]
+        with patch("simulated_drone.time.monotonic", lambda: clock[0]):
+            self.assertTrue(green.receive_claim(payload_message))
+            self.assertTrue(insufficient.receive_claim(payload_message))
+            self.assertTrue(green.receive_claim(isr_message))
+
+            for simulation_time in (2.0, 3.6, 5.2):
+                clock[0] += 0.1
+                green.set_simulation_time(simulation_time)
+                insufficient.set_simulation_time(simulation_time)
+                green.status()
+                insufficient.status()
 
         green_payload = payload_tasks(green)[0]
         task_id = str(green_payload["task_id"])
@@ -850,7 +860,7 @@ class PayloadTeamingIncrement2Test(unittest.TestCase):
         self.assertIsNone(green.active_response_task_id)
 
         green.receive_claim(payload_message)
-        green.set_simulation_time(3.0)
+        green.set_simulation_time(6.0)
         green.status()
         self.assertLessEqual(sum(int(item["quantity"]) for item in green.control_payload()["payload_reservations"].values()), 2)
 

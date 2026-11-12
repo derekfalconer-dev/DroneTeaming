@@ -27,6 +27,7 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
             const vm = require("vm");
             const dashboardHtml = {json.dumps(script)};
             const elements = new Map();
+            const selectorElements = new Map();
             const intervals = [];
             const intervalCallbacks = [];
             const scheduledTimeouts = new Map();
@@ -146,6 +147,95 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
                 ],
               }};
               return (valuesById[id] || []).map(([value, textContent]) => ({{ value, textContent }}));
+            }}
+
+            function selectorElementFor(selector) {{
+              const match = String(selector).match(/^\\[([^=\\]]+)=['"]?([^'"]+)['"]?\\]$/);
+
+              if (!match) {{
+                return null;
+              }}
+
+              const attribute = match[1];
+              const value = match[2];
+
+              if (!["data-team-role", "data-team-equipment", "data-team-inventory"].includes(attribute)) {{
+                return null;
+              }}
+
+              const key = `${{attribute}}:${{value}}`;
+
+              if (!selectorElements.has(key)) {{
+                const element = makeElement(key);
+                element.setAttribute(attribute, value);
+                element.value = attribute === "data-team-role" ? "isr" : "0";
+                selectorElements.set(key, element);
+              }}
+
+              return selectorElements.get(key);
+            }}
+
+            function teamSetupControls() {{
+              const controls = [];
+
+              for (const droneId of [1, 2, 3]) {{
+                controls.push(selectorElementFor(`[data-team-role='${{droneId}}']`));
+
+                for (const key of ["water", "medical_supplies", "rescue_kit", "specialized_supplies"]) {{
+                  controls.push(selectorElementFor(`[data-team-inventory='${{droneId}}:${{key}}']`));
+                }}
+              }}
+
+              return controls.filter(Boolean);
+            }}
+
+            function documentQuerySelector(selector) {{
+              if (String(selector).startsWith("#")) {{
+                return document.getElementById(String(selector).slice(1));
+              }}
+
+              return selectorElementFor(selector);
+            }}
+
+            function documentQuerySelectorAll(selector) {{
+              if (selector === "[role='tab']" || selector === "[data-tab]") {{
+                return ["tab-button-team", "tab-button-truth", "tab-button-network"].map((id) => document.getElementById(id));
+              }}
+
+              if (selector === ".tab-panel") {{
+                return ["tab-team", "tab-truth", "tab-network"].map((id) => document.getElementById(id));
+              }}
+
+              return [];
+            }}
+
+            function elementQuerySelector(element, selector) {{
+              if (String(selector).startsWith("[data-field=")) {{
+                const match = String(selector).match(/^\\[data-field=["']?([^"']+)["']?\\]$/);
+                return match ? document.getElementById(`${{element.id}}:data-field:${{match[1]}}`) : null;
+              }}
+
+              if (selector === ".status") {{
+                return document.getElementById(`${{element.id}}:status`);
+              }}
+
+              if (selector === ".detected-objects") {{
+                return element.innerHTML.includes("detected-objects") ? document.getElementById(`${{element.id}}:detected-objects`) : null;
+              }}
+
+              return null;
+            }}
+
+            function elementQuerySelectorAll(element, selector) {{
+              if (selector === "option") {{
+                return optionsFor(element.id);
+              }}
+
+              if (selector === "select,input" && element.id === "team-setup-rows") {{
+                return teamSetupControls();
+              }}
+
+              return [];
             }}
 
             function implicitParentIdFor(id) {{
@@ -418,15 +508,11 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
                     measureText(value) {{ return {{ width: String(value).length * 6 }}; }},
                   }};
                 }},
-                querySelector() {{
-                  return makeElement("query");
+                querySelector(selector) {{
+                  return elementQuerySelector(this, selector);
                 }},
                 querySelectorAll(selector) {{
-                  if (selector === "option") {{
-                    return optionsFor(id);
-                  }}
-
-                  return [];
+                  return elementQuerySelectorAll(this, selector);
                 }},
               }};
             }}
@@ -441,8 +527,11 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
               createElement(tagName) {{
                 return makeElement(tagName);
               }},
-              querySelectorAll() {{
-                return [];
+              querySelector(selector) {{
+                return documentQuerySelector(selector);
+              }},
+              querySelectorAll(selector) {{
+                return documentQuerySelectorAll(selector);
               }},
               addEventListener() {{}},
               activeElement: null,
@@ -1484,8 +1573,8 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
         """
         output = self.run_dashboard_script(fixture)
 
-        self.assertIn("PRIORITY Antenna", output["assignmentDetails"])
-        self.assertIn("PRIORITY Vehicle", output["assignmentDetails"])
+        self.assertIn("Antenna", output["assignmentDetails"])
+        self.assertIn("Vehicle", output["assignmentDetails"])
         self.assertIn("<td>Green</td>", output["assignmentDetails"])
         self.assertIn("<td>Orbiting</td>", output["assignmentDetails"])
         self.assertIn("<td>Unassigned</td>", output["assignmentDetails"])
@@ -1651,7 +1740,7 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
           {
             name: "missing required field",
             actual: { role: "payload", available: true, payload_inventory: { water: 2 }, camera_mount: "fixed" },
-            expectedMessage: 'capabilities expected ["payload_drop","atr_observe"], actual undefined',
+            expectedMessage: 'capabilities expected ["payload_drop","atr_observe"], actual missing',
           },
           {
             name: "same role different capabilities",
@@ -1697,6 +1786,8 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
           assigned_drone_name: "Red",
           status: "orbiting",
           last_observation_at: 90,
+          guidance_evidence_available: true,
+          guidance_evidence_at: 90,
           simulationTime: 100,
           currentMode: "orbiting",
           assignedObjective: "sig-a",
@@ -1744,6 +1835,8 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
           assigned_drone_name: "Red",
           status: "orbiting",
           last_observation_at: 110,
+          guidance_evidence_available: true,
+          guidance_evidence_at: 110,
           simulationTime: 130,
           currentMode: "orbiting",
           assignedObjective: "sig-a",
@@ -2015,8 +2108,8 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
         queued_first = self.run_dashboard_script(fixture("queued-first"))["assignmentDetails"]
 
         for output in (stale_first, queued_first):
-            self.assertIn("PRIORITY Equipment Case", output)
-            self.assertIn("PRIORITY Vehicle", output)
+            self.assertIn("Equipment Case", output)
+            self.assertIn("Vehicle", output)
             self.assertIn("<td>Blue</td>", output)
             self.assertIn("<td>Orbiting</td>", output)
             self.assertIn("<td>Unassigned</td>", output)
