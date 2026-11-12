@@ -295,6 +295,14 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
 
             function makeElement(id) {{
               let _textContent = "";
+              const _drawOps = [];
+              let _pendingPath = [];
+              const _contextState = {{
+                fillStyle: "",
+                strokeStyle: "",
+                globalAlpha: 1,
+                lineWidth: 1,
+              }};
               return {{
                 id,
                 innerHTML: initialInnerHTMLFor(id),
@@ -323,6 +331,7 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
                 height: 360,
                 parentNode: null,
                 children: [],
+                drawOps: _drawOps,
                 get outerHTML() {{
                   return `<mock-element id="${{id}}">${{this.innerHTML}}${{this.children.map((child) => child.outerHTML || child.innerHTML || "").join("")}}</mock-element>`;
                 }},
@@ -378,10 +387,35 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
                 closest() {{ return null; }},
                 getContext() {{
                   return {{
-                    clearRect() {{}}, beginPath() {{}}, moveTo() {{}}, lineTo() {{}}, stroke() {{}},
-                    fill() {{}}, arc() {{}}, closePath() {{}}, save() {{}}, translate() {{}},
-                    rotate() {{}}, restore() {{}}, fillText() {{}}, rect() {{}}, setLineDash() {{}},
-                    ellipse() {{}}, measureText(value) {{ return {{ width: String(value).length * 6 }}; }},
+                    get fillStyle() {{ return _contextState.fillStyle; }},
+                    set fillStyle(value) {{ _contextState.fillStyle = String(value); }},
+                    get strokeStyle() {{ return _contextState.strokeStyle; }},
+                    set strokeStyle(value) {{ _contextState.strokeStyle = String(value); }},
+                    get globalAlpha() {{ return _contextState.globalAlpha; }},
+                    set globalAlpha(value) {{ _contextState.globalAlpha = Number(value); }},
+                    get lineWidth() {{ return _contextState.lineWidth; }},
+                    set lineWidth(value) {{ _contextState.lineWidth = Number(value); }},
+                    clearRect(...args) {{ _drawOps.length = 0; _pendingPath = []; _drawOps.push({{ op: "clearRect", args }}); }},
+                    beginPath() {{ _pendingPath = []; }},
+                    moveTo(...args) {{ _pendingPath.push({{ op: "moveTo", args }}); }},
+                    lineTo(...args) {{ _pendingPath.push({{ op: "lineTo", args }}); }},
+                    stroke() {{ _drawOps.push({{ op: "stroke", strokeStyle: _contextState.strokeStyle, globalAlpha: _contextState.globalAlpha, path: _pendingPath.slice() }}); }},
+                    fill() {{ _drawOps.push({{ op: "fill", fillStyle: _contextState.fillStyle, globalAlpha: _contextState.globalAlpha, path: _pendingPath.slice() }}); }},
+                    arc(...args) {{
+                      const op = {{ op: "arc", args, fillStyle: _contextState.fillStyle, strokeStyle: _contextState.strokeStyle, globalAlpha: _contextState.globalAlpha }};
+                      _pendingPath.push(op);
+                      _drawOps.push(op);
+                    }},
+                    closePath() {{ _pendingPath.push({{ op: "closePath" }}); }},
+                    save() {{ _drawOps.push({{ op: "save" }}); }},
+                    translate(...args) {{ _drawOps.push({{ op: "translate", args }}); }},
+                    rotate(...args) {{ _drawOps.push({{ op: "rotate", args }}); }},
+                    restore() {{ _drawOps.push({{ op: "restore" }}); }},
+                    fillText(...args) {{ _drawOps.push({{ op: "fillText", args, fillStyle: _contextState.fillStyle, globalAlpha: _contextState.globalAlpha }}); }},
+                    rect(...args) {{ _pendingPath.push({{ op: "rect", args }}); }},
+                    setLineDash(...args) {{ _drawOps.push({{ op: "setLineDash", args }}); }},
+                    ellipse(...args) {{ _pendingPath.push({{ op: "ellipse", args }}); }},
+                    measureText(value) {{ return {{ width: String(value).length * 6 }}; }},
                   }};
                 }},
                 querySelector() {{
@@ -1099,6 +1133,138 @@ class DashboardAssignmentAggregationTest(unittest.TestCase):
         self.assertNotIn("0:operational-map", output["drawnCanvases"])
         self.assertNotIn("1:operational-map", output["drawnCanvases"])
         self.assertTrue(any(delay <= 1000 for delay in output["refreshIntervals"]))
+
+    def test_belief_maps_render_only_own_aircraft_snail_trails(self) -> None:
+        fixture = """
+        state.scenarioRunId = "trail-run";
+        state.scenarioId = "seeded_stationary_patrol";
+        state.truth = { objects: [], simulation_time: 40 };
+
+        function statusFor(droneId, timestamp, runId, trail) {
+          const baseLatitude = 37.7750 + (droneId * 0.0002);
+          const baseLongitude = -122.4230 - (droneId * 0.0002);
+          return {
+            state: "running",
+            schema_version: "v1",
+            sharing_enabled: true,
+            paused: false,
+            selected_playbook: "report_continue",
+            playbook_config_version: 2,
+            scenario_id: "seeded_stationary_patrol",
+            scenario_run_id: runId,
+            scenario_seed: 20261106,
+            timestamp,
+            current_mode: "patrol",
+            assigned_objective: null,
+            response_task: null,
+            response_tasks: [],
+            response_queue_depth: 0,
+            altitude_m: 100,
+            speed_mps: 12,
+            heading_deg: 90,
+            latitude: baseLatitude,
+            longitude: baseLongitude,
+            battery_percent: 90,
+            camera_footprint: [
+              { latitude: baseLatitude + 0.00003, longitude: baseLongitude - 0.00003 },
+              { latitude: baseLatitude + 0.00003, longitude: baseLongitude + 0.00003 },
+              { latitude: baseLatitude - 0.00003, longitude: baseLongitude },
+            ],
+            flight_trail: trail,
+            diagnostics: { peer_connection_state: [] },
+          };
+        }
+
+        state.statuses.set(1, statusFor(1, 40, "trail-run", [
+          { latitude: 37.77501, longitude: -122.42301, timestamp: 10 },
+          { latitude: 37.77502, longitude: -122.42302, timestamp: 11 },
+          { latitude: "invalid", longitude: -122.42303, timestamp: 39 },
+          { latitude: 37.77504, longitude: -122.42304, timestamp: 39 },
+        ]));
+        state.statuses.set(2, statusFor(2, 40, "trail-run", [
+          { latitude: 37.77541, longitude: -122.42341, timestamp: 12 },
+          { latitude: 37.77542, longitude: -122.42342, timestamp: 35 },
+        ]));
+        state.statuses.set(3, statusFor(3, 40, "trail-run", [
+          { latitude: 37.77581, longitude: -122.42381, timestamp: 39 },
+        ]));
+        state.beliefs.set(1, { simulation_time: 40, unresolved_observation_count: 0, objects: [] });
+        state.beliefs.set(2, { simulation_time: 40, unresolved_observation_count: 0, objects: [] });
+        state.beliefs.set(3, { simulation_time: 40, unresolved_observation_count: 0, objects: [] });
+
+        function trailOps(canvasId, color) {
+          return document.getElementById(canvasId).drawOps.filter((op) => (
+            op.op === "arc"
+            && Math.abs(Number(op.args[2]) - 3.2) < 0.001
+            && String(op.fillStyle).startsWith(color)
+          ));
+        }
+
+        function alphaValues(ops) {
+          return ops.map((op) => parseInt(String(op.fillStyle).slice(-2), 16));
+        }
+
+        renderMaps();
+        const initial = {
+          redOwnTrailCount: trailOps("belief-map-1", "#ef4444").length,
+          redBlueTrailCount: trailOps("belief-map-1", "#3b82f6").length,
+          redGreenTrailCount: trailOps("belief-map-1", "#22c55e").length,
+          blueOwnTrailCount: trailOps("belief-map-2", "#3b82f6").length,
+          blueRedTrailCount: trailOps("belief-map-2", "#ef4444").length,
+          blueGreenTrailCount: trailOps("belief-map-2", "#22c55e").length,
+          greenOwnTrailCount: trailOps("belief-map-3", "#22c55e").length,
+          greenRedTrailCount: trailOps("belief-map-3", "#ef4444").length,
+          greenBlueTrailCount: trailOps("belief-map-3", "#3b82f6").length,
+          redAlphaValues: alphaValues(trailOps("belief-map-1", "#ef4444")),
+        };
+
+        state.showFlightTrails = false;
+        renderMaps();
+        const redWithTruthTrailToggleOff = trailOps("belief-map-1", "#ef4444").length;
+
+        Date.now = () => 999999999999;
+        renderMaps();
+        const redPausedAlphaValues = alphaValues(trailOps("belief-map-1", "#ef4444"));
+
+        state.scenarioRunId = "new-trail-run";
+        renderMaps();
+        const redAfterRunReset = trailOps("belief-map-1", "#ef4444").length;
+
+        state.statuses.set(1, {
+          ...state.statuses.get(1),
+          scenario_run_id: "new-trail-run",
+          timestamp: 5,
+          flight_trail: [{ latitude: 37.77601, longitude: -122.42401, timestamp: 5 }],
+        });
+        renderMaps();
+        const redNewRunTrailCount = trailOps("belief-map-1", "#ef4444").length;
+
+        process.stdout.write(JSON.stringify({
+          ...initial,
+          redWithTruthTrailToggleOff,
+          redPausedAlphaValues,
+          redAfterRunReset,
+          redNewRunTrailCount,
+        }));
+        """
+        output = self.run_dashboard_script(fixture)
+
+        self.assertIn('id="belief-trail-toggle" type="checkbox" checked', launch_simulation.DASHBOARD_HTML)
+        self.assertEqual(2, output["redOwnTrailCount"])
+        self.assertEqual(0, output["redBlueTrailCount"])
+        self.assertEqual(0, output["redGreenTrailCount"])
+        self.assertEqual(2, output["blueOwnTrailCount"])
+        self.assertEqual(0, output["blueRedTrailCount"])
+        self.assertEqual(0, output["blueGreenTrailCount"])
+        self.assertEqual(1, output["greenOwnTrailCount"])
+        self.assertEqual(0, output["greenRedTrailCount"])
+        self.assertEqual(0, output["greenBlueTrailCount"])
+        self.assertEqual(2, len(output["redAlphaValues"]))
+        self.assertLess(output["redAlphaValues"][0], output["redAlphaValues"][1])
+        self.assertEqual(2, output["redWithTruthTrailToggleOff"])
+        self.assertEqual(output["redAlphaValues"], output["redPausedAlphaValues"])
+        self.assertEqual(0, output["redAfterRunReset"])
+        self.assertEqual(1, output["redNewRunTrailCount"])
 
     def test_harness_uses_controlled_timers_abort_controller_and_stdin_safe_fixtures(self) -> None:
         fixture = """

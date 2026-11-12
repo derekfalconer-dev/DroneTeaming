@@ -723,6 +723,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="map-title"><span>Belief display controls</span><span class="pill">display only</span></div>
     <label class="pill"><input id="measurement-toggle" type="checkbox" checked> Sensor measurements</label>
     <label class="pill"><input id="ellipse-toggle" type="checkbox" checked> Uncertainty ellipses</label>
+    <label class="pill"><input id="belief-trail-toggle" type="checkbox" checked> Own-aircraft trails</label>
     <label class="pill"><input id="priority-only-toggle" type="checkbox"> Priority only</label>
     <label class="pill"><input id="belief-label-toggle" type="checkbox"> Belief object labels</label>
     <span class="control-note">These filters affect only dashboard rendering; they do not change sensing, fusion, or allocation.</span>
@@ -835,6 +836,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       playbookConfigVersion: 0,
       pendingPlaybookConfig: null,
       showFlightTrails: true,
+      showBeliefFlightTrails: true,
       showTruthObjectLabels: true,
       showBeliefObjectLabels: false,
       showBackgroundTruthObjects: true,
@@ -1051,21 +1053,35 @@ DASHBOARD_HTML = r"""<!doctype html>
       state.currentRunKey = runKey;
     }
 
+    function isFiniteMapPoint(point) {
+      return Boolean(
+        point
+        && Number.isFinite(Number(point.latitude))
+        && Number.isFinite(Number(point.longitude)),
+      );
+    }
+
+    function appendMapPoint(points, point) {
+      if (isFiniteMapPoint(point)) {
+        points.push(point);
+      }
+    }
+
     function allMapPoints() {
       const points = [];
 
       for (const status of state.statuses.values()) {
-        points.push(status);
-        status.camera_footprint.forEach((point) => points.push(point));
-        (status.flight_trail || []).forEach((point) => points.push(point));
+        appendMapPoint(points, status);
+        (status.camera_footprint || []).forEach((point) => appendMapPoint(points, point));
+        (status.flight_trail || []).forEach((point) => appendMapPoint(points, point));
       }
 
       if (state.activeTab === "truth") {
-        state.truth.objects.forEach((object) => points.push(object));
+        state.truth.objects.forEach((object) => appendMapPoint(points, object));
       }
 
       for (const belief of state.beliefs.values()) {
-        belief.objects.forEach((object) => points.push(object));
+        belief.objects.forEach((object) => appendMapPoint(points, object));
       }
 
       return points;
@@ -1485,6 +1501,58 @@ DASHBOARD_HTML = r"""<!doctype html>
           ctx.arc(position.x, position.y, 3.2, 0, Math.PI * 2);
           ctx.fill();
         }
+      }
+    }
+
+    function statusMatchesCurrentRun(status) {
+      const statusRunId = status && (status.scenario_run_id || status.scenarioRunId);
+
+      if (!statusRunId || !state.scenarioRunId) {
+        return true;
+      }
+
+      return String(statusRunId) === String(state.scenarioRunId);
+    }
+
+    function drawOwnFlightTrail(canvas, bounds, droneId) {
+      if (!state.showBeliefFlightTrails) {
+        return;
+      }
+
+      const drone = drones.find((item) => item.id === droneId);
+      const status = state.statuses.get(droneId);
+      const simulationTime = Number(status && status.timestamp);
+
+      if (!drone || !status || !status.flight_trail || !Number.isFinite(simulationTime) || !statusMatchesCurrentRun(status)) {
+        return;
+      }
+
+      const ctx = canvas.getContext("2d");
+
+      for (const point of status.flight_trail) {
+        const pointRunId = point.scenario_run_id || point.scenarioRunId;
+        const timestamp = Number(point.timestamp);
+
+        if (
+          (pointRunId && state.scenarioRunId && String(pointRunId) !== String(state.scenarioRunId))
+          || !Number.isFinite(timestamp)
+          || !isFiniteMapPoint(point)
+        ) {
+          continue;
+        }
+
+        const age = Math.max(0, simulationTime - timestamp);
+
+        if (age >= 30) {
+          continue;
+        }
+
+        const position = project(point, bounds, canvas);
+        const opacity = Math.max(0.08, 1 - (age / 30));
+        ctx.fillStyle = `${drone.color}${Math.round(opacity * 180).toString(16).padStart(2, "0")}`;
+        ctx.beginPath();
+        ctx.arc(position.x, position.y, 3.2, 0, Math.PI * 2);
+        ctx.fill();
       }
     }
 
@@ -2017,6 +2085,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       for (const drone of drones) {
         const canvas = document.getElementById(`belief-map-${drone.id}`);
         if (drawBaseMap(canvas, bounds)) {
+          drawOwnFlightTrail(canvas, bounds, drone.id);
           drawFootprintsAndDrones(canvas, bounds, drone.id);
           drawBeliefObjects(canvas, bounds, drone.id);
         }
@@ -4279,6 +4348,11 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     document.getElementById("trail-toggle").addEventListener("change", (event) => {
       state.showFlightTrails = event.target.checked;
+      renderMaps();
+    });
+
+    document.getElementById("belief-trail-toggle").addEventListener("change", (event) => {
+      state.showBeliefFlightTrails = event.target.checked;
       renderMaps();
     });
 
