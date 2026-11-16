@@ -1,0 +1,15 @@
+# Optional standalone real-camera perception dependencies.
+# Keep separate from simulation dependencies.
+#
+# Target checked for this increment: macOS, Python 3.11, x86_64/i386-64bit.
+# Intel macOS should use portable CPU inference by default. Do not assume
+# TensorRT engines transfer between machines.
+
+# PyTorch 2.2.x Intel macOS wheels are built against NumPy 1.x and emit
+# NumPy 2.x ABI warnings. Keep this pinned below 2 until the selected
+# torch/torchvision macOS x86_64 wheel set is NumPy-2-compatible.
+numpy==1.26.4
+opencv-python==4.10.0.84
+torch>=2.2,<3; platform_system == "Darwin" and platform_machine == "x86_64"
+torchvision>=0.17,<1; platform_system == "Darwin" and platform_machine == "x86_64"
+ultralytics>=8.3,<9
