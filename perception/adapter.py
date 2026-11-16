@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from perception.detector import Detection
 from perception.exceptions import UnlocatedObservationError
@@ -46,6 +47,7 @@ class ImageObservationAdapter:
         self,
         detection: Detection,
         metadata: FrameMetadata,
+        appearance_attributes: dict[str, Any] | None = None,
     ) -> ImageObservation:
         bbox = PixelBBox(*detection.bbox_xyxy)
         scoped_track_id = (
@@ -71,6 +73,7 @@ class ImageObservationAdapter:
             track_id_scope="camera_session",
             scoped_local_track_id=scoped_track_id,
             geographic_position=dict(UNKNOWN_GEOGRAPHIC_POSITION),
+            appearance_attributes=appearance_attributes,
         )
 
 

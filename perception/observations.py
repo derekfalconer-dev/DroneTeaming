@@ -51,6 +51,10 @@ class ImageObservation:
     Track IDs are scoped only to ``camera_session_id``. They are never
     shared-world identities, and these observations intentionally do not satisfy
     simulator interfaces that require geographic position.
+
+    ``detection_confidence`` is the detector-reported score for the image
+    detection. It is useful for ranking and display, but detector scores are not
+    calibrated probabilities that the detection is correct.
     """
 
     schema_version: str
@@ -69,11 +73,16 @@ class ImageObservation:
     track_id_scope: str
     scoped_local_track_id: str | None
     geographic_position: dict[str, float | str | None]
+    appearance_attributes: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["bbox_px"] = self.bbox_px.to_dict()
         payload["geographic_position"] = dict(self.geographic_position)
+        if self.appearance_attributes is None:
+            payload.pop("appearance_attributes", None)
+        else:
+            payload["appearance_attributes"] = dict(self.appearance_attributes)
         return payload
 
     def to_json_line(self) -> str:

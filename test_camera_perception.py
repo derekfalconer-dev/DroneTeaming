@@ -128,6 +128,51 @@ class CameraPerceptionTest(unittest.TestCase):
         self.assertIsNone(observation.local_track_id)
         self.assertIsNone(observation.scoped_local_track_id)
 
+    def test_observation_serializes_optional_appearance_attributes(self):
+        adapter = ImageObservationAdapter()
+        metadata = FrameMetadata(
+            node_id="node-1",
+            camera_id="camera-0",
+            camera_session_id="session-a",
+            frame_sequence=3,
+            image_width_px=640,
+            image_height_px=480,
+            timestamp_utc="2026-11-16T12:00:00.000Z",
+        )
+        observation = adapter.observation_from_detection(
+            Detection(
+                class_name="person",
+                confidence=0.91,
+                bbox_xyxy=(10.0, 20.0, 110.0, 220.0),
+                class_id=0,
+                local_track_id=7,
+            ),
+            metadata,
+            {
+                "upper_clothing_color": {
+                    "attribute_name": "upper_clothing_color",
+                    "value": "red",
+                    "method": "opencv_hsv_upper_torso_heuristic",
+                    "method_version": "upper-clothing-color-heuristic-v1",
+                    "sampling_region_px": {"x_min": 32, "y_min": 88, "x_max": 88, "y_max": 156},
+                    "quality_score": 0.73,
+                    "quality_label": "moderate",
+                    "quality_definition": "uncalibrated test score",
+                    "reason": None,
+                }
+            },
+        )
+
+        payload = observation.to_dict()
+        line_payload = json.loads(observation.to_json_line())
+
+        self.assertEqual("red", payload["appearance_attributes"]["upper_clothing_color"]["value"])
+        self.assertEqual(
+            {"x_min": 32, "y_min": 88, "x_max": 88, "y_max": 156},
+            payload["appearance_attributes"]["upper_clothing_color"]["sampling_region_px"],
+        )
+        self.assertEqual(payload, line_payload)
+
     def test_unlocated_observation_rejected_at_geographic_boundary(self):
         observation = self.observation_for()
 

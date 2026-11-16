@@ -38,11 +38,15 @@ transfer between machines.
 
 ## Launch
 
-Built-in Mac camera:
+Explicit OpenCV camera source selection:
 
 ```bash
 python run_perception.py --source 0 --model yolov8n.pt --output observations.jsonl
 ```
+
+OpenCV camera index ordering is backend-dependent. Index `0` is not guaranteed
+to be the built-in Mac camera, and the runner preserves the requested source
+without silently falling back to another device.
 
 USB/UVC camera:
 
@@ -50,11 +54,42 @@ USB/UVC camera:
 python run_perception.py --source 1 --model yolov8n.pt --output observations-usb.jsonl
 ```
 
+List reliably discoverable camera names without loading YOLO:
+
+```bash
+python run_perception.py --list-cameras
+```
+
+Camera names are reported only when the operating system provides them
+reliably. The list is informational and is not treated as an OpenCV index map.
+
 Disable display for bounded smoke runs:
 
 ```bash
 python run_perception.py --source 0 --model yolov8n.pt --output observations.jsonl --no-display --max-frames 50
 ```
+
+## Live display
+
+By default, the display shows annotated video beside a clearly visible text
+panel. The panel includes:
+
+- selected source
+- node ID, camera ID, and camera session ID
+- processing FPS
+- frame number
+- frame-receipt UTC timestamp
+- cumulative observation count
+- geographic position status, which is currently unknown
+- current observations with track ID, class, confidence, and pixel box
+
+The current-observation rows are rendered from the same observation objects
+sent to JSONL. When no observations are present, the rows are cleared and the
+panel shows `none`.
+
+The video is scaled only for display so the combined video/panel fits a
+practical desktop window while preserving aspect ratio. JSONL pixel coordinates
+remain in the original frame coordinate system.
 
 ## JSONL output
 

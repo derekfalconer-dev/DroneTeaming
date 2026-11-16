@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from perception.adapter import ImageObservationAdapter, frame_metadata_from_frame
+from perception.appearance import AppearanceAnalyzer, create_default_appearance_analyzer
 from perception.detector import Detection, Detector
 from perception.observations import ImageObservation
 
@@ -51,6 +53,8 @@ class RunnerConfig:
     camera_session_id: str
     timestamp_provenance: str = "system_utc_capture_time"
     max_frames: int | None = None
+    source_label: str = "unknown"
+    appearance_debug: bool = False
 
     @classmethod
     def create(
@@ -61,6 +65,8 @@ class RunnerConfig:
         camera_session_id: str | None = None,
         timestamp_provenance: str = "system_utc_capture_time",
         max_frames: int | None = None,
+        source_label: str = "unknown",
+        appearance_debug: bool = False,
     ) -> "RunnerConfig":
         return cls(
             node_id=node_id,
@@ -68,6 +74,8 @@ class RunnerConfig:
             camera_session_id=camera_session_id or f"{camera_id}-{uuid.uuid4().hex[:12]}",
             timestamp_provenance=timestamp_provenance,
             max_frames=max_frames,
+            source_label=source_label,
+            appearance_debug=appearance_debug,
         )
 
 
@@ -88,6 +96,7 @@ class CameraPerceptionRunner:
         writer: ObservationWriter,
         adapter: ImageObservationAdapter | None = None,
         display: Display | None = None,
+        appearance_analyzer: AppearanceAnalyzer | None = None,
     ) -> None:
         self.config = config
         self.capture = capture
@@ -95,6 +104,11 @@ class CameraPerceptionRunner:
         self.writer = writer
         self.adapter = adapter or ImageObservationAdapter()
         self.display = display
+        self.appearance_analyzer = (
+            appearance_analyzer
+            if appearance_analyzer is not None
+            else create_default_appearance_analyzer()
+        )
 
     def run(self) -> RunnerResult:
         frames_processed = 0
@@ -104,6 +118,8 @@ class CameraPerceptionRunner:
         try:
             self.capture.open()
 
+            run_started_at = time.monotonic()
+
             while self.config.max_frames is None or frames_processed < self.config.max_frames:
                 ok, frame = self.capture.read()
 
@@ -112,7 +128,6 @@ class CameraPerceptionRunner:
                     break
 
                 frame_sequence = frames_processed + 1
-                detections = self.detector.track(frame)
                 metadata = frame_metadata_from_frame(
                     frame=frame,
                     node_id=self.config.node_id,
@@ -121,13 +136,37 @@ class CameraPerceptionRunner:
                     frame_sequence=frame_sequence,
                     timestamp_provenance=self.config.timestamp_provenance,
                 )
+                detections = self.detector.track(frame)
+                appearance_attributes = self.appearance_analyzer.analyze_frame(frame, detections)
                 observations = self.adapter.observations_for_frame(detections, metadata)
+                observations = self._attach_appearance_attributes(observations, appearance_attributes)
                 self.writer.write_observations(observations)
                 observations_written += len(observations)
                 frames_processed += 1
 
                 if self.display is not None:
-                    self.display.show(frame, detections)
+                    panel_show = getattr(self.display, "show_observation_panel", None)
+                    if callable(panel_show):
+                        elapsed_seconds = max(time.monotonic() - run_started_at, 0.000001)
+                        panel_show(
+                            frame,
+                            detections,
+                            observations,
+                            {
+                                "source_label": self.config.source_label,
+                                "node_id": self.config.node_id,
+                                "camera_id": self.config.camera_id,
+                                "camera_session_id": self.config.camera_session_id,
+                                "processing_fps": frames_processed / elapsed_seconds,
+                                "frame_sequence": frame_sequence,
+                                "frame_timestamp_utc": metadata.timestamp_utc,
+                                "observations_written": observations_written,
+                                "appearance_debug": self.config.appearance_debug,
+                            },
+                        )
+                    else:
+                        self.display.show(frame, detections)
+
                     if self.display.poll_key() in QUIT_KEYS:
                         stopped_reason = "user_requested"
                         break
@@ -145,3 +184,21 @@ class CameraPerceptionRunner:
             observations_written=observations_written,
             stopped_reason=stopped_reason,
         )
+
+    def _attach_appearance_attributes(
+        self,
+        observations: list[ImageObservation],
+        appearance_attributes: list[dict[str, dict[str, object]] | None],
+    ) -> list[ImageObservation]:
+        if not appearance_attributes:
+            return observations
+
+        updated_observations: list[ImageObservation] = []
+        for index, observation in enumerate(observations):
+            attributes = appearance_attributes[index] if index < len(appearance_attributes) else None
+            if attributes is not None and isinstance(observation, ImageObservation):
+                updated_observations.append(replace(observation, appearance_attributes=attributes))
+            else:
+                updated_observations.append(observation)
+
+        return updated_observations
