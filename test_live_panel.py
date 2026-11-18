@@ -127,6 +127,8 @@ class LivePanelRunnerTest(unittest.TestCase):
                 camera_session_id="session-a",
                 max_frames=1,
                 source_label="0",
+                requested_inference_size_px=1280,
+                model_identifier="test-model.pt",
             ),
             capture=capture,
             detector=FakeDetector(),
@@ -145,15 +147,61 @@ class LivePanelRunnerTest(unittest.TestCase):
         self.assertEqual(display.context["source_label"], "0")
         self.assertEqual(display.context["node_id"], "node-a")
         self.assertEqual(display.context["camera_id"], "camera-a")
+        self.assertEqual(display.context["class_filter_label"], "all model classes")
         self.assertEqual(display.context["camera_session_id"], "session-a")
         self.assertEqual(display.context["frame_sequence"], 1)
         self.assertEqual(display.context["observations_written"], 1)
+        self.assertEqual(display.context["requested_inference_size_px"], 1280)
+        self.assertEqual(display.context["model_identifier"], "test-model.pt")
+        self.assertEqual(display.context["frame_width_px"], 640)
+        self.assertEqual(display.context["frame_height_px"], 480)
         self.assertFalse(display.context["appearance_debug"])
         self.assertIn("frame_timestamp_utc", display.context)
         self.assertIn("processing_fps", display.context)
         self.assertTrue(capture.released)
         self.assertTrue(writer.closed)
         self.assertTrue(display.closed)
+
+    def test_runner_passes_empty_observation_list_to_clear_current_panel_rows(self) -> None:
+        capture = FakeCapture()
+        adapter = FakeAdapter()
+        adapter.observations = []
+        writer = FakeWriter()
+        display = FakeDisplay()
+
+        runner = CameraPerceptionRunner(
+            config=RunnerConfig.create(
+                node_id="node-a",
+                camera_id="camera-a",
+                camera_session_id="session-a",
+                max_frames=1,
+                source_label="0",
+            ),
+            capture=capture,
+            detector=FakeDetector(),
+            writer=writer,
+            adapter=adapter,
+            display=display,
+        )
+
+        result = runner.run()
+
+        self.assertEqual(result.frames_processed, 1)
+        self.assertEqual(result.observations_written, 0)
+        self.assertEqual([], writer.observation_batches[0])
+        self.assertEqual([], display.observations)
+
+    def test_display_formats_inference_request_as_requested_size_not_tensor_shape(self) -> None:
+        display = object.__new__(OpenCVDisplay)
+
+        self.assertEqual(
+            "imgsz=1280px requested; tensor shape may differ",
+            display._format_inference_request(1280),
+        )
+        self.assertEqual(
+            "3840x2160 px",
+            display._format_frame_dimensions({"frame_width_px": 3840, "frame_height_px": 2160}),
+        )
 
     def test_display_observation_lines_include_serialized_clothing_color_attributes(self) -> None:
         display = object.__new__(OpenCVDisplay)
@@ -220,7 +268,7 @@ class LivePanelRunnerTest(unittest.TestCase):
 
         self.assertGreater(len(lines), 3)
         self.assertTrue(all(len(line) <= 54 for line in lines[1:]))
-        self.assertIn("  Reason:", lines)
+        self.assertTrue(any(line.startswith("  Reason:") for line in lines))
 
     def test_display_debug_appearance_lines_include_sampling_region_dimensions_and_quality(self) -> None:
         display = object.__new__(OpenCVDisplay)
@@ -243,6 +291,25 @@ class LivePanelRunnerTest(unittest.TestCase):
                                 "y_max": 156,
                             },
                             "reason": None,
+                            "diagnostics": {
+                                "color_evidence": {
+                                    "sample_analyzed": True,
+                                    "top_candidates": [
+                                        {"color": "red", "fraction_of_sample": 0.5},
+                                        {"color": "blue", "fraction_of_sample": 0.25},
+                                        {"color": "green", "fraction_of_sample": 0.1},
+                                    ],
+                                },
+                                "decision": {
+                                    "quality_score": 0.73,
+                                    "rejection_reason": None,
+                                    "thresholds": {
+                                        "minimum_valid_pixel_fraction": 0.35,
+                                        "minimum_dominant_share": 0.55,
+                                        "minimum_winner_gap": 0.2,
+                                    },
+                                },
+                            },
                         }
                     },
                 ),
@@ -255,8 +322,63 @@ class LivePanelRunnerTest(unittest.TestCase):
             [
                 "Person | Track 35 | Detection score 94%",
                 "  Upper clothing: red | Color quality: moderate",
-                "  Sample: x=32 y=88 w=56 h=68 px",
-                "  Quality score: 0.73",
+                "  Sample: x=32 y=88 w=56 h=68 px original",
+                "  Top colors: red 50.0%, blue 25.0%, green 10.0% of",
+                "  sample",
+                "  Quality score: 0.73; thresholds: valid>=35%,",
+                "  top>=55%, gap>=20%",
+                "  Rejection: none",
+            ],
+        )
+
+    def test_display_debug_appearance_lines_show_unavailable_evidence_reason(self) -> None:
+        display = object.__new__(OpenCVDisplay)
+
+        lines = display._observation_lines(
+            [
+                FakeObservation(
+                    local_track_id=35,
+                    class_name="person",
+                    detection_confidence=0.94,
+                    appearance_attributes={
+                        "upper_clothing_color": {
+                            "value": "unknown",
+                            "quality_label": "unavailable",
+                            "quality_score": None,
+                            "sampling_region_px": None,
+                            "reason": "crop_too_small",
+                            "diagnostics": {
+                                "color_evidence": {
+                                    "sample_analyzed": False,
+                                    "unavailable_reason": "crop_too_small",
+                                },
+                                "decision": {
+                                    "quality_score": None,
+                                    "rejection_reason": "crop_too_small",
+                                    "thresholds": {
+                                        "minimum_valid_pixel_fraction": 0.35,
+                                        "minimum_dominant_share": 0.55,
+                                        "minimum_winner_gap": 0.2,
+                                    },
+                                },
+                            },
+                        }
+                    },
+                ),
+            ],
+            appearance_debug=True,
+        )
+
+        self.assertEqual(
+            lines,
+            [
+                "Person | Track 35 | Detection score 94%",
+                "  Upper clothing: unknown | Color quality: unavailable",
+                "  Reason: crop_too_small",
+                "  Evidence unavailable: crop_too_small",
+                "  Quality score: unavailable; thresholds: valid>=35%,",
+                "  top>=55%, gap>=20%",
+                "  Rejection: crop_too_small",
             ],
         )
 

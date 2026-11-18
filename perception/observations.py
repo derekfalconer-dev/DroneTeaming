@@ -55,6 +55,14 @@ class ImageObservation:
     ``detection_confidence`` is the detector-reported score for the image
     detection. It is useful for ranking and display, but detector scores are not
     calibrated probabilities that the detection is correct.
+
+    ``appearance_attributes`` is an additive schema extension point. Current
+    upper-clothing color attributes may include a ``diagnostics`` object with
+    raw color evidence, explicit denominators, thresholds, rejection conditions,
+    and the heuristic quality calculation. No-sample appearance quality is
+    serialized as ``null``; analyzed samples with a calculated zero quality
+    retain numeric ``0.0``. Readers should ignore unknown nested fields to
+    preserve forward compatibility.
     """
 
     schema_version: str

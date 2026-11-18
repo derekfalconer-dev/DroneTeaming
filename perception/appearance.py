@@ -16,11 +16,22 @@ from perception.exceptions import MissingDependencyError
 
 UPPER_CLOTHING_COLOR_ATTRIBUTE = "upper_clothing_color"
 UPPER_CLOTHING_COLOR_METHOD = "opencv_hsv_upper_torso_heuristic"
-UPPER_CLOTHING_COLOR_METHOD_VERSION = "upper-clothing-color-heuristic-v1"
+UPPER_CLOTHING_COLOR_METHOD_VERSION = "upper-clothing-color-heuristic-v2"
 UPPER_CLOTHING_COLOR_QUALITY_DEFINITION = (
     "Uncalibrated heuristic score derived from dominant HSV palette share and "
     "separation from the next palette color in a fixed upper-body crop; it is "
     "not a probability and must not be treated as identity evidence."
+)
+UPPER_CLOTHING_COLOR_QUALITY_FORMULA = (
+    "round(clamp((top_share_of_valid_color_pixels * 0.7) + "
+    "(winner_gap_of_valid_color_pixels * 0.3), 0.0, 1.0), 2)"
+)
+PIXEL_COLOR_ANALYZER_VERSION = "hsv-pixel-color-rules-v2"
+PIXEL_COLOR_RULE_RATIONALE = (
+    "Dark pixels with only weak saturation are classified as neutral before hue "
+    "rules are considered, because hue is unstable in low-light nearly neutral "
+    "pixels. Genuinely chromatic dark colors remain available when saturation is "
+    "strong enough to support the hue assignment."
 )
 
 
@@ -64,6 +75,329 @@ class NoOpAppearanceAnalyzer:
         return [None for _ in detections]
 
 
+class PixelColorAnalyzer:
+    """Classify sampled BGR pixels into a small HSV color palette.
+
+    Object-specific code decides which pixels to sample. This analyzer only
+    handles pixel color classification, evidence aggregation, and diagnostics.
+    """
+
+    minimum_valid_pixel_fraction = 0.35
+    minimum_dominant_share = 0.55
+    minimum_winner_gap = 0.20
+    dark_value_threshold = 90
+    black_value_threshold = 45
+    dark_neutral_saturation_threshold = 70
+    chromatic_saturation_threshold = 55
+    dark_chromatic_saturation_threshold = 80
+
+    def __init__(self, *, cv2: object, numpy: object) -> None:
+        self.cv2: Any = cv2
+        self.numpy: Any = numpy
+
+    def analyze(
+        self,
+        bgr_region: object,
+        *,
+        validity_mask: object | None = None,
+    ) -> Mapping[str, object]:
+        bgr_region = self._as_bgr_crop(bgr_region)
+        shape = getattr(bgr_region, "shape", ())
+        if len(shape) < 2:
+            return self._unavailable_result("unsupported_sample_type")
+
+        total_pixels = int(shape[0]) * int(shape[1])
+        if total_pixels == 0:
+            return self._unavailable_result("empty_sample")
+
+        hsv_region = self.cv2.cvtColor(bgr_region, self.cv2.COLOR_BGR2HSV)
+        hue = hsv_region[:, :, 0].astype(self.numpy.int16)
+        saturation = hsv_region[:, :, 1].astype(self.numpy.int16)
+        value = hsv_region[:, :, 2].astype(self.numpy.int16)
+
+        analyzed_mask = self.numpy.ones(hue.shape, dtype=bool)
+        if validity_mask is not None:
+            analyzed_mask = self.numpy.asarray(validity_mask, dtype=bool)
+            if analyzed_mask.shape != hue.shape:
+                raise ValueError("Pixel-color validity mask must match the sampled region shape.")
+
+        labels = self.numpy.full(hue.shape, "excluded", dtype=object)
+        self._assign(labels, analyzed_mask & (value < self.black_value_threshold), "black")
+        self._assign(
+            labels,
+            analyzed_mask
+            & (labels == "excluded")
+            & (value < self.dark_value_threshold)
+            & (saturation < self.dark_neutral_saturation_threshold),
+            "black",
+        )
+        self._assign(
+            labels,
+            analyzed_mask & (labels == "excluded") & (saturation < 35) & (value > 205),
+            "white",
+        )
+        self._assign(
+            labels,
+            analyzed_mask
+            & (labels == "excluded")
+            & (saturation < 35)
+            & (value >= self.dark_value_threshold)
+            & (value <= 205),
+            "gray",
+        )
+        self._assign(
+            labels,
+            analyzed_mask
+            & (labels == "excluded")
+            & (hue >= 8)
+            & (hue <= 24)
+            & (saturation >= 45)
+            & (value >= self.black_value_threshold)
+            & (value < 160),
+            "brown",
+        )
+
+        chromatic_support = (
+            analyzed_mask
+            & (labels == "excluded")
+            & (value >= self.black_value_threshold)
+            & (
+                ((value >= self.dark_value_threshold) & (saturation >= self.chromatic_saturation_threshold))
+                | ((value < self.dark_value_threshold) & (saturation >= self.dark_chromatic_saturation_threshold))
+            )
+        )
+        self._assign(labels, chromatic_support & ((hue <= 9) | (hue >= 170)), "red")
+        self._assign(labels, chromatic_support & (labels == "excluded") & (hue >= 10) & (hue <= 24) & (value >= 160), "orange")
+        self._assign(labels, chromatic_support & (labels == "excluded") & (hue >= 25) & (hue <= 34) & (value >= 70), "yellow")
+        self._assign(labels, chromatic_support & (labels == "excluded") & (hue >= 35) & (hue <= 84), "green")
+        self._assign(labels, chromatic_support & (labels == "excluded") & (hue >= 85) & (hue <= 99), "cyan")
+        self._assign(labels, chromatic_support & (labels == "excluded") & (hue >= 100) & (hue <= 129), "blue")
+        self._assign(labels, chromatic_support & (labels == "excluded") & (hue >= 130) & (hue <= 154), "purple")
+        self._assign(labels, chromatic_support & (labels == "excluded") & (hue >= 155) & (hue <= 169) & (value >= 70), "pink")
+
+        palette = (
+            "black",
+            "white",
+            "gray",
+            "brown",
+            "red",
+            "orange",
+            "yellow",
+            "green",
+            "cyan",
+            "blue",
+            "purple",
+            "pink",
+        )
+        counts = {
+            color_name: int(self.numpy.count_nonzero(labels == color_name))
+            for color_name in palette
+        }
+        analyzed_pixels = int(self.numpy.count_nonzero(analyzed_mask))
+        invalid_pixels = total_pixels - analyzed_pixels
+        valid_pixels = sum(counts.values())
+        excluded_pixels = max(0, analyzed_pixels - valid_pixels)
+        valid_pixel_fraction = valid_pixels / total_pixels if total_pixels > 0 else 0.0
+        ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        top_color, top_count = ranked[0] if ranked else ("unknown", 0)
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        top_share = top_count / valid_pixels if valid_pixels > 0 else 0.0
+        winner_gap = (top_count - second_count) / valid_pixels if valid_pixels > 0 else 0.0
+        quality_score = (
+            round(max(0.0, min(1.0, (top_share * 0.7) + (winner_gap * 0.3))), 2)
+            if valid_pixels > 0
+            else None
+        )
+        quality_label = self._quality_label(quality_score) if quality_score is not None else "unavailable"
+        failed_valid_fraction = valid_pixel_fraction < self.minimum_valid_pixel_fraction
+        failed_dominance = top_share < self.minimum_dominant_share
+        failed_winner_gap = winner_gap < self.minimum_winner_gap
+        rejection_reason = (
+            "insufficient_evidence"
+            if failed_valid_fraction or failed_dominance or failed_winner_gap
+            else None
+        )
+        diagnostics = self._sample_diagnostics(
+            counts=counts,
+            ranked=ranked,
+            total_pixels=total_pixels,
+            analyzed_pixels=analyzed_pixels,
+            invalid_pixels=invalid_pixels,
+            valid_pixels=valid_pixels,
+            excluded_pixels=excluded_pixels,
+            valid_pixel_fraction=valid_pixel_fraction,
+            top_color=top_color,
+            top_count=top_count,
+            second_count=second_count,
+            top_share=top_share,
+            winner_gap=winner_gap,
+            quality_score=quality_score,
+            quality_label=quality_label,
+            rejection_reason=rejection_reason,
+            rejection_conditions={
+                "valid_fraction_below_minimum": failed_valid_fraction,
+                "dominant_share_below_minimum": failed_dominance,
+                "winner_gap_below_minimum": failed_winner_gap,
+            },
+        )
+
+        if rejection_reason is not None:
+            return {
+                "value": "unknown",
+                "reason": rejection_reason,
+                "quality_score": quality_score,
+                "pixel_color_analyzer_version": PIXEL_COLOR_ANALYZER_VERSION,
+                "color_rule_rationale": PIXEL_COLOR_RULE_RATIONALE,
+                "quality_label": quality_label,
+                "diagnostics": diagnostics,
+            }
+
+        return {
+            "value": top_color,
+            "reason": None,
+            "quality_score": quality_score,
+            "quality_label": quality_label,
+            "diagnostics": diagnostics,
+        }
+
+    def _assign(self, labels: object, mask: object, color_name: str) -> None:
+        labels[mask] = color_name
+
+    def _sample_diagnostics(
+        self,
+        *,
+        counts: Mapping[str, int],
+        ranked: list[tuple[str, int]],
+        total_pixels: int,
+        analyzed_pixels: int,
+        invalid_pixels: int,
+        valid_pixels: int,
+        excluded_pixels: int,
+        valid_pixel_fraction: float,
+        top_color: str,
+        top_count: int,
+        second_count: int,
+        top_share: float,
+        winner_gap: float,
+        quality_score: float | None,
+        quality_label: str,
+        rejection_reason: str | None,
+        rejection_conditions: Mapping[str, bool],
+    ) -> dict[str, object]:
+        return {
+            "method": UPPER_CLOTHING_COLOR_METHOD,
+            "method_version": UPPER_CLOTHING_COLOR_METHOD_VERSION,
+            "pixel_color_analyzer_version": PIXEL_COLOR_ANALYZER_VERSION,
+            "color_rule_rationale": PIXEL_COLOR_RULE_RATIONALE,
+            "color_evidence": {
+                "sample_analyzed": True,
+                "candidate_fraction_denominator": "total_sample_pixels",
+                "valid_fraction_denominator": "total_sample_pixels",
+                "total_sample_pixels": total_pixels,
+                "analyzed_sample_pixel_count": analyzed_pixels,
+                "invalid_sample_pixel_count": invalid_pixels,
+                "valid_color_pixel_count": valid_pixels,
+                "excluded_pixel_count": excluded_pixels,
+                "valid_pixel_fraction": round(valid_pixel_fraction, 4),
+                "palette_counts": dict(counts),
+                "top_candidates": [
+                    {
+                        "color": color_name,
+                        "pixel_count": count,
+                        "fraction_of_sample": round(count / total_pixels, 4)
+                        if total_pixels > 0
+                        else None,
+                        "fraction_of_valid_color_pixels": round(count / valid_pixels, 4)
+                        if valid_pixels > 0
+                        else None,
+                    }
+                    for color_name, count in ranked[:3]
+                ],
+            },
+            "decision": {
+                "method": UPPER_CLOTHING_COLOR_METHOD,
+                "method_version": UPPER_CLOTHING_COLOR_METHOD_VERSION,
+                "pixel_color_analyzer_version": PIXEL_COLOR_ANALYZER_VERSION,
+                "accepted": rejection_reason is None,
+                "accepted_color_label": top_color if rejection_reason is None else None,
+                "rejection_reason": rejection_reason,
+                "quality_score": quality_score,
+                "quality_label": quality_label,
+                "quality_formula": UPPER_CLOTHING_COLOR_QUALITY_FORMULA,
+                "quality_inputs": {
+                    "top_color": top_color,
+                    "top_color_pixel_count": top_count,
+                    "second_color_pixel_count": second_count,
+                    "valid_color_pixel_count": valid_pixels,
+                    "top_share_of_valid_color_pixels": round(top_share, 4),
+                    "winner_gap_of_valid_color_pixels": round(winner_gap, 4),
+                },
+                "thresholds": self._decision_thresholds(),
+                "rejection_conditions": dict(rejection_conditions),
+            },
+        }
+
+    def _unavailable_result(self, reason: str) -> Mapping[str, object]:
+        return {
+            "value": "unknown",
+            "reason": reason,
+            "quality_score": None,
+            "quality_label": "unavailable",
+            "diagnostics": {
+                "method": UPPER_CLOTHING_COLOR_METHOD,
+                "method_version": UPPER_CLOTHING_COLOR_METHOD_VERSION,
+                "pixel_color_analyzer_version": PIXEL_COLOR_ANALYZER_VERSION,
+                "color_rule_rationale": PIXEL_COLOR_RULE_RATIONALE,
+                "color_evidence": {
+                    "sample_analyzed": False,
+                    "unavailable_reason": reason,
+                },
+                "decision": {
+                    "method": UPPER_CLOTHING_COLOR_METHOD,
+                    "method_version": UPPER_CLOTHING_COLOR_METHOD_VERSION,
+                    "pixel_color_analyzer_version": PIXEL_COLOR_ANALYZER_VERSION,
+                    "accepted": False,
+                    "accepted_color_label": None,
+                    "rejection_reason": reason,
+                    "quality_score": None,
+                    "quality_label": "unavailable",
+                    "quality_formula": UPPER_CLOTHING_COLOR_QUALITY_FORMULA,
+                    "thresholds": self._decision_thresholds(),
+                    "rejection_conditions": {
+                        "no_sample_analyzed": True,
+                    },
+                },
+            },
+        }
+
+    def _decision_thresholds(self) -> dict[str, float | int]:
+        return {
+            "minimum_valid_pixel_fraction": self.minimum_valid_pixel_fraction,
+            "minimum_dominant_share": self.minimum_dominant_share,
+            "minimum_winner_gap": self.minimum_winner_gap,
+            "dark_value_threshold": self.dark_value_threshold,
+            "black_value_threshold": self.black_value_threshold,
+            "dark_neutral_saturation_threshold": self.dark_neutral_saturation_threshold,
+            "chromatic_saturation_threshold": self.chromatic_saturation_threshold,
+            "dark_chromatic_saturation_threshold": self.dark_chromatic_saturation_threshold,
+        }
+
+    def _as_bgr_crop(self, crop: object) -> object:
+        shape = getattr(crop, "shape", ())
+        if len(shape) == 2:
+            return self.cv2.cvtColor(crop, self.cv2.COLOR_GRAY2BGR)
+        if len(shape) == 3 and shape[2] == 4:
+            return self.cv2.cvtColor(crop, self.cv2.COLOR_BGRA2BGR)
+        return crop
+
+    def _quality_label(self, quality_score: float) -> str:
+        if quality_score >= 0.78:
+            return "high"
+        if quality_score >= 0.55:
+            return "moderate"
+        return "low"
+
+
 class OpenCVUpperClothingColorAnalyzer:
     """Estimate dominant upper-clothing color for sufficiently visible people.
 
@@ -99,6 +433,7 @@ class OpenCVUpperClothingColorAnalyzer:
 
         self.cv2: Any = cv2
         self.numpy: Any = numpy
+        self.pixel_color_analyzer = PixelColorAnalyzer(cv2=cv2, numpy=numpy)
 
     def analyze_frame(
         self,
@@ -154,12 +489,20 @@ class OpenCVUpperClothingColorAnalyzer:
         resized_crop = self._resize_crop(crop)
         color_result = self._dominant_palette_color(resized_crop)
         if color_result["value"] == "unknown":
-            return self._unknown(
-                str(color_result["reason"]),
-                sampling_region=sampling_region,
-                quality_score=float(color_result["quality_score"]),
-                quality_label=str(color_result["quality_label"]),
-            )
+            return {
+                UPPER_CLOTHING_COLOR_ATTRIBUTE: {
+                    "attribute_name": UPPER_CLOTHING_COLOR_ATTRIBUTE,
+                    "value": "unknown",
+                    "method": UPPER_CLOTHING_COLOR_METHOD,
+                    "method_version": UPPER_CLOTHING_COLOR_METHOD_VERSION,
+                    "sampling_region_px": sampling_region.to_dict(),
+                    "quality_score": color_result["quality_score"],
+                    "quality_label": color_result["quality_label"],
+                    "quality_definition": UPPER_CLOTHING_COLOR_QUALITY_DEFINITION,
+                    "reason": color_result["reason"],
+                    "diagnostics": color_result["diagnostics"],
+                }
+            }
 
         return {
             UPPER_CLOTHING_COLOR_ATTRIBUTE: {
@@ -172,6 +515,7 @@ class OpenCVUpperClothingColorAnalyzer:
                 "quality_label": color_result["quality_label"],
                 "quality_definition": UPPER_CLOTHING_COLOR_QUALITY_DEFINITION,
                 "reason": None,
+                "diagnostics": color_result["diagnostics"],
             }
         }
 
@@ -226,60 +570,48 @@ class OpenCVUpperClothingColorAnalyzer:
         return self.cv2.resize(crop, resized_size, interpolation=self.cv2.INTER_AREA)
 
     def _dominant_palette_color(self, bgr_crop: object) -> Mapping[str, object]:
-        bgr_crop = self._as_bgr_crop(bgr_crop)
-        hsv_crop = self.cv2.cvtColor(bgr_crop, self.cv2.COLOR_BGR2HSV)
-        hue = hsv_crop[:, :, 0].astype(self.numpy.int16)
-        saturation = hsv_crop[:, :, 1].astype(self.numpy.int16)
-        value = hsv_crop[:, :, 2].astype(self.numpy.int16)
-        total_pixels = int(hue.size)
+        return self.pixel_color_analyzer.analyze(bgr_crop)
 
-        masks = {
-            "black": value < 45,
-            "white": (saturation < 35) & (value > 205),
-            "gray": (saturation < 35) & (value >= 45) & (value <= 205),
-            "brown": (hue >= 8) & (hue <= 24) & (saturation >= 45) & (value >= 45) & (value < 160),
-            "red": ((hue <= 9) | (hue >= 170)) & (saturation >= 55) & (value >= 45),
-            "orange": (hue >= 10) & (hue <= 24) & (saturation >= 55) & (value >= 160),
-            "yellow": (hue >= 25) & (hue <= 34) & (saturation >= 55) & (value >= 70),
-            "green": (hue >= 35) & (hue <= 84) & (saturation >= 55) & (value >= 45),
-            "cyan": (hue >= 85) & (hue <= 99) & (saturation >= 55) & (value >= 45),
-            "blue": (hue >= 100) & (hue <= 129) & (saturation >= 55) & (value >= 45),
-            "purple": (hue >= 130) & (hue <= 154) & (saturation >= 55) & (value >= 45),
-            "pink": (hue >= 155) & (hue <= 169) & (saturation >= 55) & (value >= 70),
-        }
-        counts = {
-            color_name: int(self.numpy.count_nonzero(mask))
-            for color_name, mask in masks.items()
-        }
-        valid_pixels = sum(counts.values())
-        if total_pixels == 0 or valid_pixels / total_pixels < self.minimum_valid_pixel_fraction:
-            return {
-                "value": "unknown",
-                "reason": "insufficient_evidence",
-                "quality_score": 0.0,
-                "quality_label": "unavailable",
-            }
-
-        ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
-        top_color, top_count = ranked[0]
-        second_count = ranked[1][1] if len(ranked) > 1 else 0
-        top_share = top_count / valid_pixels
-        winner_gap = (top_count - second_count) / valid_pixels
-        quality_score = round(max(0.0, min(1.0, (top_share * 0.7) + (winner_gap * 0.3))), 2)
-
-        if top_share < self.minimum_dominant_share or winner_gap < self.minimum_winner_gap:
-            return {
-                "value": "unknown",
-                "reason": "insufficient_evidence",
-                "quality_score": quality_score,
-                "quality_label": "low",
-            }
-
+    def _unavailable_diagnostics(
+        self,
+        reason: str,
+        *,
+        quality_score: float | None = None,
+        quality_label: str = "unavailable",
+    ) -> dict[str, object]:
         return {
-            "value": top_color,
-            "reason": None,
-            "quality_score": quality_score,
-            "quality_label": self._quality_label(quality_score),
+            "method": UPPER_CLOTHING_COLOR_METHOD,
+            "method_version": UPPER_CLOTHING_COLOR_METHOD_VERSION,
+            "color_evidence": {
+                "sample_analyzed": False,
+                "unavailable_reason": reason,
+            },
+            "decision": {
+                "method": UPPER_CLOTHING_COLOR_METHOD,
+                "method_version": UPPER_CLOTHING_COLOR_METHOD_VERSION,
+                "accepted": False,
+                "accepted_color_label": None,
+                "rejection_reason": reason,
+                "quality_score": quality_score,
+                "quality_label": quality_label,
+                "quality_formula": UPPER_CLOTHING_COLOR_QUALITY_FORMULA,
+                "thresholds": self._decision_thresholds(),
+                "rejection_conditions": {
+                    "no_sample_analyzed": True,
+                },
+            },
+        }
+
+    def _decision_thresholds(self) -> dict[str, float | int]:
+        return {
+            "minimum_valid_pixel_fraction": self.minimum_valid_pixel_fraction,
+            "minimum_dominant_share": self.minimum_dominant_share,
+            "minimum_winner_gap": self.minimum_winner_gap,
+            "minimum_person_box_width_px": self.minimum_person_box_width_px,
+            "minimum_person_box_height_px": self.minimum_person_box_height_px,
+            "minimum_sampling_width_px": self.minimum_sampling_width_px,
+            "minimum_sampling_height_px": self.minimum_sampling_height_px,
+            "minimum_person_aspect_ratio": self.minimum_person_aspect_ratio,
         }
 
     def _as_bgr_crop(self, crop: object) -> object:
@@ -302,19 +634,25 @@ class OpenCVUpperClothingColorAnalyzer:
         reason: str,
         *,
         sampling_region: SamplingRegion | None = None,
-        quality_score: float = 0.0,
+        quality_score: float | None = None,
         quality_label: str = "unavailable",
     ) -> dict[str, dict[str, object]]:
+        quality_score = round(quality_score, 2) if quality_score is not None else None
         attribute: dict[str, object] = {
             "attribute_name": UPPER_CLOTHING_COLOR_ATTRIBUTE,
             "value": "unknown",
             "method": UPPER_CLOTHING_COLOR_METHOD,
             "method_version": UPPER_CLOTHING_COLOR_METHOD_VERSION,
             "sampling_region_px": sampling_region.to_dict() if sampling_region is not None else None,
-            "quality_score": round(quality_score, 2),
+            "quality_score": quality_score,
             "quality_label": quality_label,
             "quality_definition": UPPER_CLOTHING_COLOR_QUALITY_DEFINITION,
             "reason": reason,
+            "diagnostics": self._unavailable_diagnostics(
+                reason,
+                quality_score=quality_score,
+                quality_label=quality_label,
+            ),
         }
         return {UPPER_CLOTHING_COLOR_ATTRIBUTE: attribute}
 

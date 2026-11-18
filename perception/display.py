@@ -128,6 +128,10 @@ class OpenCVDisplay:
             f"Source: {context.get('source_label', 'unknown')}",
             f"Node: {context.get('node_id', 'unknown')}",
             f"Camera: {context.get('camera_id', 'unknown')}",
+            f"Class filter: {context.get('class_filter_label', 'all model classes')}",
+            f"Model: {context.get('model_identifier') or 'unknown'}",
+            f"Inference request: {self._format_inference_request(context.get('requested_inference_size_px'))}",
+            f"Original frame: {self._format_frame_dimensions(context)}",
             f"Session: {context.get('camera_session_id', 'unknown')}",
             f"FPS: {float(context.get('processing_fps', 0.0)):.1f}",
             f"Frame: {context.get('frame_sequence', 'unknown')}",
@@ -168,6 +172,33 @@ class OpenCVDisplay:
 
         return panel
 
+    def _format_inference_request(self, value: object) -> str:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return "unknown; tensor shape may differ"
+
+        requested_size = float(value)
+        if not math.isfinite(requested_size) or requested_size <= 0:
+            return "unknown; tensor shape may differ"
+
+        return f"imgsz={int(round(requested_size))}px requested; tensor shape may differ"
+
+    def _format_frame_dimensions(self, context: Mapping[str, object]) -> str:
+        width_px = context.get("frame_width_px")
+        height_px = context.get("frame_height_px")
+        if (
+            isinstance(width_px, bool)
+            or isinstance(height_px, bool)
+            or not isinstance(width_px, int | float)
+            or not isinstance(height_px, int | float)
+            or not math.isfinite(float(width_px))
+            or not math.isfinite(float(height_px))
+            or width_px <= 0
+            or height_px <= 0
+        ):
+            return "unknown"
+
+        return f"{int(round(float(width_px)))}x{int(round(float(height_px)))} px"
+
     def _observation_lines(
         self,
         observations: list[ImageObservation],
@@ -176,13 +207,24 @@ class OpenCVDisplay:
     ) -> list[str]:
         lines: list[str] = []
         maximum_observations = 5
+        maximum_panel_lines = 22
 
         for observation in observations[:maximum_observations]:
+            if len(lines) >= maximum_panel_lines:
+                break
+
             payload = observation.to_dict()
             lines.append(self._format_observation_line(payload))
-            lines.extend(self._format_appearance_lines(payload, appearance_debug=appearance_debug))
+            for detail_line in self._format_appearance_lines(
+                payload,
+                appearance_debug=appearance_debug,
+            ):
+                if len(lines) >= maximum_panel_lines:
+                    lines.append("... additional details hidden")
+                    return lines
+                lines.append(detail_line)
 
-        if len(observations) > maximum_observations:
+        if len(observations) > maximum_observations and len(lines) < maximum_panel_lines:
             lines.append(f"... {len(observations) - maximum_observations} more")
 
         return lines
@@ -223,35 +265,147 @@ class OpenCVDisplay:
             lines.extend(self._wrap_panel_text(f"  Reason: {reason}"))
 
         if appearance_debug:
-            region = attribute.get("sampling_region_px")
-            if isinstance(region, Mapping):
-                values = [
-                    region.get("x_min"),
-                    region.get("y_min"),
-                    region.get("x_max"),
-                    region.get("y_max"),
-                ]
-                if all(isinstance(value, int | float) for value in values):
-                    x_min, y_min, x_max, y_max = [int(round(float(value))) for value in values]
-                    width_px = max(0, x_max - x_min)
-                    height_px = max(0, y_max - y_min)
-                    lines.extend(
-                        self._wrap_panel_text(
-                            f"  Sample: x={x_min} y={y_min} w={width_px} h={height_px} px"
-                        )
-                    )
-
-            quality_score = attribute.get("quality_score")
-            if (
-                not isinstance(quality_score, bool)
-                and isinstance(quality_score, int | float)
-                and math.isfinite(float(quality_score))
-            ):
-                lines.extend(
-                    self._wrap_panel_text(f"  Quality score: {float(quality_score):.2f}")
-                )
+            lines.extend(self._format_appearance_debug_lines(attribute))
 
         return lines
+
+    def _format_appearance_debug_lines(self, attribute: Mapping[str, object]) -> list[str]:
+        diagnostics = attribute.get("diagnostics")
+        if not isinstance(diagnostics, Mapping):
+            return self._format_legacy_appearance_debug_lines(attribute)
+
+        lines: list[str] = []
+        evidence = diagnostics.get("color_evidence")
+        decision = diagnostics.get("decision")
+
+        if isinstance(evidence, Mapping) and evidence.get("sample_analyzed") is True:
+            lines.extend(self._format_sampling_region_lines(attribute))
+            candidates = evidence.get("top_candidates")
+            if isinstance(candidates, Sequence) and not isinstance(candidates, str | bytes):
+                candidate_parts: list[str] = []
+                for candidate in candidates[:3]:
+                    if not isinstance(candidate, Mapping):
+                        continue
+
+                    color = candidate.get("color")
+                    fraction = candidate.get("fraction_of_sample")
+                    if (
+                        color is not None
+                        and not isinstance(fraction, bool)
+                        and isinstance(fraction, int | float)
+                        and math.isfinite(float(fraction))
+                    ):
+                        candidate_parts.append(f"{color} {float(fraction) * 100:.1f}%")
+
+                if candidate_parts:
+                    lines.extend(
+                        self._wrap_panel_text(
+                            f"  Top colors: {', '.join(candidate_parts)} of sample"
+                        )
+                    )
+        elif isinstance(evidence, Mapping):
+            reason = evidence.get("unavailable_reason")
+            if reason:
+                lines.extend(self._wrap_panel_text(f"  Evidence unavailable: {reason}"))
+
+        if isinstance(decision, Mapping):
+            lines.extend(self._format_decision_debug_lines(decision, attribute))
+        else:
+            lines.extend(self._format_legacy_quality_lines(attribute))
+
+        return lines
+
+    def _format_sampling_region_lines(self, attribute: Mapping[str, object]) -> list[str]:
+        region = attribute.get("sampling_region_px")
+        if not isinstance(region, Mapping):
+            return []
+
+        values = [
+            region.get("x_min"),
+            region.get("y_min"),
+            region.get("x_max"),
+            region.get("y_max"),
+        ]
+        if not all(isinstance(value, int | float) for value in values):
+            return []
+
+        x_min, y_min, x_max, y_max = [int(round(float(value))) for value in values]
+        width_px = max(0, x_max - x_min)
+        height_px = max(0, y_max - y_min)
+        return self._wrap_panel_text(
+            f"  Sample: x={x_min} y={y_min} w={width_px} h={height_px} px original"
+        )
+
+    def _format_decision_debug_lines(
+        self,
+        decision: Mapping[str, object],
+        attribute: Mapping[str, object],
+    ) -> list[str]:
+        lines: list[str] = []
+        quality_score = decision.get("quality_score", attribute.get("quality_score"))
+        thresholds = decision.get("thresholds")
+
+        if isinstance(quality_score, bool):
+            return lines
+
+        if isinstance(quality_score, int | float) and math.isfinite(float(quality_score)):
+            quality_text = f"{float(quality_score):.2f}"
+        elif quality_score is None:
+            quality_text = "unavailable"
+        else:
+            quality_text = None
+
+        if quality_text is not None:
+            threshold_text = self._format_decision_threshold_text(thresholds)
+            if threshold_text:
+                lines.extend(
+                    self._wrap_panel_text(
+                        f"  Quality score: {quality_text}; thresholds: {threshold_text}"
+                    )
+                )
+            else:
+                lines.extend(self._wrap_panel_text(f"  Quality score: {quality_text}"))
+
+        rejection_reason = decision.get("rejection_reason", attribute.get("reason"))
+        lines.extend(self._wrap_panel_text(f"  Rejection: {rejection_reason or 'none'}"))
+        return lines
+
+    def _format_decision_threshold_text(self, thresholds: object) -> str:
+        if not isinstance(thresholds, Mapping):
+            return ""
+
+        threshold_parts: list[str] = []
+        for key, label in (
+            ("minimum_valid_pixel_fraction", "valid"),
+            ("minimum_dominant_share", "top"),
+            ("minimum_winner_gap", "gap"),
+        ):
+            value = thresholds.get(key)
+            if (
+                not isinstance(value, bool)
+                and isinstance(value, int | float)
+                and math.isfinite(float(value))
+            ):
+                threshold_parts.append(f"{label}>={float(value) * 100:.0f}%")
+
+        return ", ".join(threshold_parts)
+
+    def _format_legacy_appearance_debug_lines(self, attribute: Mapping[str, object]) -> list[str]:
+        return [
+            *self._format_sampling_region_lines(attribute),
+            *self._format_legacy_quality_lines(attribute),
+        ]
+
+    def _format_legacy_quality_lines(self, attribute: Mapping[str, object]) -> list[str]:
+        quality_score = attribute.get("quality_score")
+        if (
+            not isinstance(quality_score, bool)
+            and isinstance(quality_score, int | float)
+            and math.isfinite(float(quality_score))
+        ):
+            return self._wrap_panel_text(f"  Quality score: {float(quality_score):.2f}")
+
+        return []
 
     def _wrap_panel_text(self, text: str, *, maximum_chars: int = 54) -> list[str]:
         leading_space_count = len(text) - len(text.lstrip(" "))

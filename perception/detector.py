@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from perception.exceptions import MissingDependencyError, ModelLoadError
+
+
+DEFAULT_SAR_CLASS_NAMES = (
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "bus",
+    "truck",
+    "boat",
+    "airplane",
+)
+
+
+class DetectionClassFilterError(ValueError):
+    """Raised when a requested detection class filter cannot be resolved."""
 
 
 @dataclass(frozen=True)
@@ -26,10 +43,67 @@ class Detector(Protocol):
         """Return detections with nullable persistent local track IDs."""
 
 
+@dataclass(frozen=True)
+class DetectionClassFilter:
+    requested_names: tuple[str, ...] | None
+    matched_names: tuple[str, ...]
+    class_ids: tuple[int, ...]
+    available_names: tuple[str, ...]
+    unsupported_names: tuple[str, ...]
+
+    @property
+    def enabled(self) -> bool:
+        return self.requested_names is not None
+
+    @property
+    def inference_class_ids(self) -> list[int] | None:
+        return list(self.class_ids) if self.enabled else None
+
+    @property
+    def panel_label(self) -> str:
+        if not self.enabled:
+            return "all model classes"
+
+        if not self.matched_names:
+            return "none"
+
+        joined_names = ", ".join(self.matched_names)
+        return joined_names if len(joined_names) <= 72 else f"{len(self.matched_names)} classes"
+
+    @property
+    def startup_label(self) -> str:
+        if not self.enabled:
+            return "all model classes"
+
+        label = ", ".join(self.matched_names) if self.matched_names else "none"
+        if self.unsupported_names:
+            label = f"{label} (unsupported by model: {', '.join(self.unsupported_names)})"
+
+        return label
+
+    def allows(self, class_id: int | None, class_name: str) -> bool:
+        if not self.enabled:
+            return True
+
+        if class_id in self.class_ids:
+            return True
+
+        normalized_names = {_normalize_class_name(name) for name in self.matched_names}
+        return _normalize_class_name(class_name) in normalized_names
+
+
 class UltralyticsYoloTracker:
     """Ultralytics YOLO detector with persistent local tracking enabled."""
 
-    def __init__(self, model_path: str, confidence_threshold: float = 0.25, device: str | None = None) -> None:
+    def __init__(
+        self,
+        model_path: str,
+        confidence_threshold: float = 0.25,
+        device: str | None = None,
+        class_names: Sequence[str] | None = DEFAULT_SAR_CLASS_NAMES,
+        strict_class_names: bool = False,
+        inference_image_size: int = 640,
+    ) -> None:
         try:
             from ultralytics import YOLO
         except ModuleNotFoundError as error:
@@ -38,8 +112,12 @@ class UltralyticsYoloTracker:
                 "for example with: python -m pip install -r requirements-perception.txt"
             ) from error
 
+        if isinstance(inference_image_size, bool) or inference_image_size <= 0:
+            raise ValueError("inference_image_size must be a positive integer.")
+
         self.confidence_threshold = confidence_threshold
         self.device = device
+        self.inference_image_size = inference_image_size
 
         try:
             self.model = YOLO(model_path)
@@ -50,15 +128,31 @@ class UltralyticsYoloTracker:
                 "TensorRT engines generated on a different host."
             ) from error
 
+        self.names_by_id = _class_names_by_id(getattr(self.model, "names", {}))
+        self.class_filter = resolve_detection_class_filter(
+            self.names_by_id,
+            class_names,
+            strict=strict_class_names,
+        )
+
     def track(self, frame: object) -> list[Detection]:
+        track_kwargs = {
+            "persist": True,
+            "conf": self.confidence_threshold,
+            "verbose": False,
+            "device": self.device,
+            "classes": self.class_filter.inference_class_ids,
+            "imgsz": self.inference_image_size,
+        }
+
         try:
-            results = self.model.track(
-                frame,
-                persist=True,
-                conf=self.confidence_threshold,
-                verbose=False,
-                device=self.device,
-            )
+            results = self.model.track(frame, **track_kwargs)
+        except TypeError:
+            track_kwargs.pop("classes", None)
+            try:
+                results = self.model.track(frame, **track_kwargs)
+            except Exception as error:  # noqa: BLE001
+                raise ModelLoadError(f"YOLO inference/tracking failed: {error}") from error
         except Exception as error:  # noqa: BLE001
             raise ModelLoadError(f"YOLO inference/tracking failed: {error}") from error
 
@@ -69,7 +163,6 @@ class UltralyticsYoloTracker:
             if boxes is None:
                 continue
 
-            names = getattr(result, "names", None) or getattr(self.model, "names", {}) or {}
             xyxy_values = _to_python_list(getattr(boxes, "xyxy", []))
             confidence_values = _to_python_list(getattr(boxes, "conf", []))
             class_values = _to_python_list(getattr(boxes, "cls", []))
@@ -78,8 +171,11 @@ class UltralyticsYoloTracker:
             for index, xyxy in enumerate(xyxy_values):
                 class_id = _optional_int(_value_at(class_values, index))
                 track_id = _optional_int(_value_at(track_values, index))
-                class_name = str(names.get(class_id, class_id if class_id is not None else "unknown"))
+                class_name = str(self.names_by_id.get(class_id, class_id if class_id is not None else "unknown"))
                 confidence = float(_value_at(confidence_values, index, 0.0))
+
+                if not self.class_filter.allows(class_id, class_name):
+                    continue
 
                 detections.append(
                     Detection(
@@ -92,6 +188,87 @@ class UltralyticsYoloTracker:
                 )
 
         return detections
+
+    def filter_detections(self, detections: list[Detection]) -> list[Detection]:
+        return [
+            detection
+            for detection in detections
+            if self.class_filter.allows(detection.class_id, detection.class_name)
+        ]
+
+
+def resolve_detection_class_filter(
+    available_names_by_id: Mapping[int, str],
+    requested_names: Sequence[str] | None,
+    *,
+    strict: bool = False,
+) -> DetectionClassFilter:
+    available_names = tuple(available_names_by_id[class_id] for class_id in sorted(available_names_by_id))
+    if requested_names is None:
+        return DetectionClassFilter(
+            requested_names=None,
+            matched_names=available_names,
+            class_ids=tuple(sorted(available_names_by_id)),
+            available_names=available_names,
+            unsupported_names=(),
+        )
+
+    name_to_id = {
+        _normalize_class_name(name): class_id
+        for class_id, name in available_names_by_id.items()
+    }
+    matched_names: list[str] = []
+    class_ids: list[int] = []
+    unsupported_names: list[str] = []
+    seen_names: set[str] = set()
+
+    for requested_name in requested_names:
+        normalized_name = _normalize_class_name(requested_name)
+        if not normalized_name or normalized_name in seen_names:
+            continue
+
+        seen_names.add(normalized_name)
+        class_id = name_to_id.get(normalized_name)
+        if class_id is None:
+            unsupported_names.append(requested_name)
+            continue
+
+        class_ids.append(class_id)
+        matched_names.append(available_names_by_id[class_id])
+
+    if strict and unsupported_names:
+        raise DetectionClassFilterError(
+            "Unsupported class name(s): "
+            f"{', '.join(unsupported_names)}. Available model classes: {', '.join(available_names)}"
+        )
+
+    return DetectionClassFilter(
+        requested_names=tuple(requested_names),
+        matched_names=tuple(matched_names),
+        class_ids=tuple(class_ids),
+        available_names=available_names,
+        unsupported_names=tuple(unsupported_names),
+    )
+
+
+def _class_names_by_id(value: object) -> dict[int, str]:
+    if isinstance(value, Mapping):
+        names_by_id: dict[int, str] = {}
+        for raw_class_id, raw_name in value.items():
+            class_id = _optional_int(raw_class_id)
+            if class_id is not None:
+                names_by_id[class_id] = str(raw_name)
+
+        return names_by_id
+
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return {index: str(name) for index, name in enumerate(value)}
+
+    return {}
+
+
+def _normalize_class_name(value: str) -> str:
+    return " ".join(value.strip().lower().replace("_", " ").split())
 
 
 def _to_python_list(value: Any) -> list[Any]:

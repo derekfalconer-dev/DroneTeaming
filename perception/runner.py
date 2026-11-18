@@ -55,6 +55,9 @@ class RunnerConfig:
     max_frames: int | None = None
     source_label: str = "unknown"
     appearance_debug: bool = False
+    class_filter_label: str = "all model classes"
+    requested_inference_size_px: int | None = None
+    model_identifier: str | None = None
 
     @classmethod
     def create(
@@ -67,6 +70,9 @@ class RunnerConfig:
         max_frames: int | None = None,
         source_label: str = "unknown",
         appearance_debug: bool = False,
+        class_filter_label: str = "all model classes",
+        requested_inference_size_px: int | None = None,
+        model_identifier: str | None = None,
     ) -> "RunnerConfig":
         return cls(
             node_id=node_id,
@@ -76,6 +82,9 @@ class RunnerConfig:
             max_frames=max_frames,
             source_label=source_label,
             appearance_debug=appearance_debug,
+            class_filter_label=class_filter_label,
+            requested_inference_size_px=requested_inference_size_px,
+            model_identifier=model_identifier,
         )
 
 
@@ -136,8 +145,12 @@ class CameraPerceptionRunner:
                     frame_sequence=frame_sequence,
                     timestamp_provenance=self.config.timestamp_provenance,
                 )
-                detections = self.detector.track(frame)
-                appearance_attributes = self.appearance_analyzer.analyze_frame(frame, detections)
+                detections = self._filter_detections(self.detector.track(frame))
+                appearance_attributes = (
+                    self.appearance_analyzer.analyze_frame(frame, detections)
+                    if detections
+                    else []
+                )
                 observations = self.adapter.observations_for_frame(detections, metadata)
                 observations = self._attach_appearance_attributes(observations, appearance_attributes)
                 self.writer.write_observations(observations)
@@ -162,6 +175,11 @@ class CameraPerceptionRunner:
                                 "frame_timestamp_utc": metadata.timestamp_utc,
                                 "observations_written": observations_written,
                                 "appearance_debug": self.config.appearance_debug,
+                                "class_filter_label": self.config.class_filter_label,
+                                "requested_inference_size_px": self.config.requested_inference_size_px,
+                                "model_identifier": self.config.model_identifier,
+                                "frame_width_px": metadata.image_width_px,
+                                "frame_height_px": metadata.image_height_px,
                             },
                         )
                     else:
@@ -184,6 +202,13 @@ class CameraPerceptionRunner:
             observations_written=observations_written,
             stopped_reason=stopped_reason,
         )
+
+    def _filter_detections(self, detections: list[Detection]) -> list[Detection]:
+        filter_detections = getattr(self.detector, "filter_detections", None)
+        if callable(filter_detections):
+            return list(filter_detections(detections))
+
+        return detections
 
     def _attach_appearance_attributes(
         self,
