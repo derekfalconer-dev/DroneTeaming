@@ -73,6 +73,8 @@ class ImageObservationAdapter:
             track_id_scope="camera_session",
             scoped_local_track_id=scoped_track_id,
             geographic_position=dict(UNKNOWN_GEOGRAPHIC_POSITION),
+            model_class_id=detection.class_id,
+            model_class_name=detection.model_class_name or detection.class_name,
             appearance_attributes=appearance_attributes,
         )
 

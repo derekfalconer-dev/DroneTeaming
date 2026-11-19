@@ -81,12 +81,18 @@ class ImageObservation:
     track_id_scope: str
     scoped_local_track_id: str | None
     geographic_position: dict[str, float | str | None]
+    model_class_id: int | None = None
+    model_class_name: str | None = None
     appearance_attributes: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["bbox_px"] = self.bbox_px.to_dict()
         payload["geographic_position"] = dict(self.geographic_position)
+        if self.model_class_id is None:
+            payload.pop("model_class_id", None)
+        if self.model_class_name is None:
+            payload.pop("model_class_name", None)
         if self.appearance_attributes is None:
             payload.pop("appearance_attributes", None)
         else:

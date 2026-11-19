@@ -148,6 +148,8 @@ class LivePanelRunnerTest(unittest.TestCase):
         self.assertEqual(display.context["node_id"], "node-a")
         self.assertEqual(display.context["camera_id"], "camera-a")
         self.assertEqual(display.context["class_filter_label"], "all model classes")
+        self.assertEqual(display.context["label_profile"], "coco")
+        self.assertEqual(display.context["active_class_label"], "all model classes")
         self.assertEqual(display.context["camera_session_id"], "session-a")
         self.assertEqual(display.context["frame_sequence"], 1)
         self.assertEqual(display.context["observations_written"], 1)
@@ -190,6 +192,34 @@ class LivePanelRunnerTest(unittest.TestCase):
         self.assertEqual(result.observations_written, 0)
         self.assertEqual([], writer.observation_batches[0])
         self.assertEqual([], display.observations)
+
+    def test_runner_passes_label_profile_and_active_classes_to_display_panel(self) -> None:
+        capture = FakeCapture()
+        adapter = FakeAdapter()
+        writer = FakeWriter()
+        display = FakeDisplay()
+
+        runner = CameraPerceptionRunner(
+            config=RunnerConfig.create(
+                node_id="node-a",
+                camera_id="camera-a",
+                camera_session_id="session-a",
+                max_frames=1,
+                label_profile="visdrone",
+                active_class_label="person, car, van",
+            ),
+            capture=capture,
+            detector=FakeDetector(),
+            writer=writer,
+            adapter=adapter,
+            display=display,
+        )
+
+        runner.run()
+
+        self.assertIsNotNone(display.context)
+        self.assertEqual(display.context["label_profile"], "visdrone")
+        self.assertEqual(display.context["active_class_label"], "person, car, van")
 
     def test_display_formats_inference_request_as_requested_size_not_tensor_shape(self) -> None:
         display = object.__new__(OpenCVDisplay)

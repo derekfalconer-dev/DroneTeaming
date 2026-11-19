@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from perception.exceptions import MissingDependencyError, ModelLoadError
 
@@ -13,6 +13,7 @@ DEFAULT_SAR_CLASS_NAMES = (
     "person",
     "bicycle",
     "car",
+    "van",
     "motorcycle",
     "bus",
     "truck",
@@ -20,9 +21,37 @@ DEFAULT_SAR_CLASS_NAMES = (
     "airplane",
 )
 
+LabelProfileName = Literal["coco", "visdrone"]
+LABEL_PROFILE_NAMES: tuple[LabelProfileName, ...] = ("coco", "visdrone")
+
 
 class DetectionClassFilterError(ValueError):
     """Raised when a requested detection class filter cannot be resolved."""
+
+
+@dataclass(frozen=True)
+class LabelProfile:
+    name: LabelProfileName
+    aliases: Mapping[str, str]
+
+    def normalize_source_name(self, source_name: str) -> str:
+        normalized_source_name = _normalize_class_name(source_name)
+        return self.aliases.get(normalized_source_name, normalized_source_name)
+
+
+LABEL_PROFILES: dict[str, LabelProfile] = {
+    "coco": LabelProfile(name="coco", aliases={}),
+    "visdrone": LabelProfile(
+        name="visdrone",
+        aliases={
+            "pedestrian": "person",
+            "people": "person",
+            "motor": "motorcycle",
+            "awning-tricycle": "awning-tricycle",
+            "awning tricycle": "awning-tricycle",
+        },
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -33,6 +62,7 @@ class Detection:
     confidence: float
     bbox_xyxy: tuple[float, float, float, float]
     class_id: int | None = None
+    model_class_name: str | None = None
     local_track_id: int | None = None
 
 
@@ -50,6 +80,7 @@ class DetectionClassFilter:
     class_ids: tuple[int, ...]
     available_names: tuple[str, ...]
     unsupported_names: tuple[str, ...]
+    matched_source_names: tuple[str, ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -76,6 +107,9 @@ class DetectionClassFilter:
             return "all model classes"
 
         label = ", ".join(self.matched_names) if self.matched_names else "none"
+        if self.matched_source_names:
+            source_label = ", ".join(self.matched_source_names)
+            label = f"{label} [model classes: {source_label}]"
         if self.unsupported_names:
             label = f"{label} (unsupported by model: {', '.join(self.unsupported_names)})"
 
@@ -103,6 +137,7 @@ class UltralyticsYoloTracker:
         class_names: Sequence[str] | None = DEFAULT_SAR_CLASS_NAMES,
         strict_class_names: bool = False,
         inference_image_size: int = 640,
+        label_profile: LabelProfileName = "coco",
     ) -> None:
         try:
             from ultralytics import YOLO
@@ -118,6 +153,7 @@ class UltralyticsYoloTracker:
         self.confidence_threshold = confidence_threshold
         self.device = device
         self.inference_image_size = inference_image_size
+        self.label_profile = resolve_label_profile(label_profile)
 
         try:
             self.model = YOLO(model_path)
@@ -129,10 +165,15 @@ class UltralyticsYoloTracker:
             ) from error
 
         self.names_by_id = _class_names_by_id(getattr(self.model, "names", {}))
-        self.class_filter = resolve_detection_class_filter(
+        self.normalized_names_by_id = normalize_class_names_by_profile(
             self.names_by_id,
+            self.label_profile,
+        )
+        self.class_filter = resolve_detection_class_filter(
+            self.normalized_names_by_id,
             class_names,
             strict=strict_class_names,
+            source_names_by_id=self.names_by_id,
         )
 
     def track(self, frame: object) -> list[Detection]:
@@ -171,7 +212,10 @@ class UltralyticsYoloTracker:
             for index, xyxy in enumerate(xyxy_values):
                 class_id = _optional_int(_value_at(class_values, index))
                 track_id = _optional_int(_value_at(track_values, index))
-                class_name = str(self.names_by_id.get(class_id, class_id if class_id is not None else "unknown"))
+                model_class_name = str(
+                    self.names_by_id.get(class_id, class_id if class_id is not None else "unknown")
+                )
+                class_name = str(self.normalized_names_by_id.get(class_id, model_class_name))
                 confidence = float(_value_at(confidence_values, index, 0.0))
 
                 if not self.class_filter.allows(class_id, class_name):
@@ -183,6 +227,7 @@ class UltralyticsYoloTracker:
                         confidence=confidence,
                         bbox_xyxy=tuple(float(value) for value in xyxy[:4]),  # type: ignore[arg-type]
                         class_id=class_id,
+                        model_class_name=model_class_name,
                         local_track_id=track_id,
                     ),
                 )
@@ -202,44 +247,59 @@ def resolve_detection_class_filter(
     requested_names: Sequence[str] | None,
     *,
     strict: bool = False,
+    source_names_by_id: Mapping[int, str] | None = None,
 ) -> DetectionClassFilter:
-    available_names = tuple(available_names_by_id[class_id] for class_id in sorted(available_names_by_id))
+    available_names = _unique_in_order(
+        available_names_by_id[class_id] for class_id in sorted(available_names_by_id)
+    )
     if requested_names is None:
+        class_ids = tuple(sorted(available_names_by_id))
         return DetectionClassFilter(
             requested_names=None,
             matched_names=available_names,
-            class_ids=tuple(sorted(available_names_by_id)),
+            class_ids=class_ids,
             available_names=available_names,
             unsupported_names=(),
+            matched_source_names=_source_names_for_ids(class_ids, source_names_by_id),
         )
 
-    name_to_id = {
-        _normalize_class_name(name): class_id
-        for class_id, name in available_names_by_id.items()
-    }
+    name_to_ids: dict[str, list[int]] = {}
+    for class_id, name in available_names_by_id.items():
+        name_to_ids.setdefault(_normalize_class_name(name), []).append(class_id)
+
     matched_names: list[str] = []
     class_ids: list[int] = []
     unsupported_names: list[str] = []
-    seen_names: set[str] = set()
+    seen_requested_names: set[str] = set()
+    seen_class_ids: set[int] = set()
 
     for requested_name in requested_names:
         normalized_name = _normalize_class_name(requested_name)
-        if not normalized_name or normalized_name in seen_names:
+        if not normalized_name or normalized_name in seen_requested_names:
             continue
 
-        seen_names.add(normalized_name)
-        class_id = name_to_id.get(normalized_name)
-        if class_id is None:
+        seen_requested_names.add(normalized_name)
+        matched_class_ids = name_to_ids.get(normalized_name, [])
+        if not matched_class_ids:
             unsupported_names.append(requested_name)
             continue
 
-        class_ids.append(class_id)
-        matched_names.append(available_names_by_id[class_id])
+        matched_names.append(available_names_by_id[matched_class_ids[0]])
+        for class_id in sorted(matched_class_ids):
+            if class_id not in seen_class_ids:
+                class_ids.append(class_id)
+                seen_class_ids.add(class_id)
 
     if strict and unsupported_names:
         raise DetectionClassFilterError(
             "Unsupported class name(s): "
-            f"{', '.join(unsupported_names)}. Available model classes: {', '.join(available_names)}"
+            f"{', '.join(unsupported_names)}. Available model classes (normalized): {', '.join(available_names)}"
+        )
+
+    if strict and not class_ids:
+        raise DetectionClassFilterError(
+            "Requested class filter did not match any classes in the loaded model. "
+            f"Available model classes (normalized): {', '.join(available_names)}"
         )
 
     return DetectionClassFilter(
@@ -248,7 +308,39 @@ def resolve_detection_class_filter(
         class_ids=tuple(class_ids),
         available_names=available_names,
         unsupported_names=tuple(unsupported_names),
+        matched_source_names=_source_names_for_ids(class_ids, source_names_by_id),
     )
+
+
+def resolve_label_profile(label_profile: str) -> LabelProfile:
+    try:
+        return LABEL_PROFILES[label_profile]
+    except KeyError as error:
+        raise DetectionClassFilterError(
+            f"Unsupported label profile {label_profile!r}. Supported profiles: {', '.join(LABEL_PROFILE_NAMES)}"
+        ) from error
+
+
+def normalize_class_names_by_profile(
+    names_by_id: Mapping[int, str],
+    label_profile: LabelProfile,
+) -> dict[int, str]:
+    seen_source_names: dict[str, int] = {}
+    normalized_names_by_id: dict[int, str] = {}
+
+    for class_id, source_name in names_by_id.items():
+        normalized_source_name = _normalize_class_name(source_name)
+        if normalized_source_name in seen_source_names:
+            first_class_id = seen_source_names[normalized_source_name]
+            raise DetectionClassFilterError(
+                "Ambiguous model class metadata: source label "
+                f"{source_name!r} appears for class IDs {first_class_id} and {class_id}."
+            )
+
+        seen_source_names[normalized_source_name] = class_id
+        normalized_names_by_id[class_id] = label_profile.normalize_source_name(source_name)
+
+    return normalized_names_by_id
 
 
 def _class_names_by_id(value: object) -> dict[int, str]:
@@ -269,6 +361,27 @@ def _class_names_by_id(value: object) -> dict[int, str]:
 
 def _normalize_class_name(value: str) -> str:
     return " ".join(value.strip().lower().replace("_", " ").split())
+
+
+def _unique_in_order(values: Sequence[str] | object) -> tuple[str, ...]:
+    unique_values: list[str] = []
+    seen: set[str] = set()
+    for value in values:  # type: ignore[union-attr]
+        if value not in seen:
+            unique_values.append(value)
+            seen.add(value)
+
+    return tuple(unique_values)
+
+
+def _source_names_for_ids(
+    class_ids: Sequence[int],
+    source_names_by_id: Mapping[int, str] | None,
+) -> tuple[str, ...]:
+    if source_names_by_id is None:
+        return ()
+
+    return tuple(source_names_by_id[class_id] for class_id in class_ids if class_id in source_names_by_id)
 
 
 def _to_python_list(value: Any) -> list[Any]:

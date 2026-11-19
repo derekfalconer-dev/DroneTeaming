@@ -151,6 +151,13 @@ class RunPerceptionCliTest(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         run_perception.parse_args()
 
+    def test_label_profile_defaults_to_coco_and_accepts_visdrone(self):
+        with patch.object(sys, "argv", ["run_perception.py"]):
+            self.assertEqual("coco", run_perception.parse_args().label_profile)
+
+        with patch.object(sys, "argv", ["run_perception.py", "--label-profile", "visdrone"]):
+            self.assertEqual("visdrone", run_perception.parse_args().label_profile)
+
 
 class DetectionClassFilteringTest(unittest.TestCase):
     def setUp(self):
@@ -186,6 +193,7 @@ class DetectionClassFilteringTest(unittest.TestCase):
         tracker.track(object())
         self.assertEqual([0, 2, 99, 10], model.track_calls[0]["classes"])
         self.assertEqual(640, model.track_calls[0]["imgsz"])
+        self.assertEqual("coco", tracker.label_profile.name)
 
     def test_custom_imgsz_is_passed_to_ultralytics_track(self):
         model = FakeUltralyticsModel(rows=[], names=self.names)
@@ -254,6 +262,121 @@ class DetectionClassFilteringTest(unittest.TestCase):
 
         empty_tracker = self.tracker_for(FakeUltralyticsModel(rows=[], names=self.names))
         self.assertEqual([], empty_tracker.track(object()))
+
+    def test_visdrone_reordered_ids_normalize_without_assuming_coco_ids(self):
+        names = {
+            4: "truck",
+            9: "pedestrian",
+            1: "motor",
+            7: "people",
+            2: "van",
+        }
+        rows = [
+            {"class_id": 9, "confidence": 0.91, "bbox": (1.0, 2.0, 3.0, 4.0), "track_id": 10},
+            {"class_id": 7, "confidence": 0.82, "bbox": (5.0, 6.0, 7.0, 8.0), "track_id": 11},
+            {"class_id": 1, "confidence": 0.73, "bbox": (9.0, 10.0, 11.0, 12.0), "track_id": 12},
+            {"class_id": 2, "confidence": 0.64, "bbox": (13.0, 14.0, 15.0, 16.0), "track_id": 13},
+        ]
+        model = FakeUltralyticsModel(rows=rows, names=names)
+        tracker = self.tracker_for(model, label_profile="visdrone")
+
+        detections = tracker.track(object())
+
+        self.assertCountEqual([9, 1, 7, 2, 4], model.track_calls[0]["classes"])
+        self.assertEqual(
+            ["person", "person", "motorcycle", "van"],
+            [detection.class_name for detection in detections],
+        )
+        self.assertEqual(
+            ["pedestrian", "people", "motor", "van"],
+            [detection.model_class_name for detection in detections],
+        )
+
+    def test_visdrone_person_filter_selects_pedestrian_and_people_source_ids(self):
+        names = {
+            10: "car",
+            20: "people",
+            30: "pedestrian",
+            40: "motor",
+        }
+        rows = [
+            {"class_id": 10, "confidence": 0.91, "bbox": (1.0, 2.0, 3.0, 4.0), "track_id": 10},
+            {"class_id": 20, "confidence": 0.82, "bbox": (5.0, 6.0, 7.0, 8.0), "track_id": 11},
+            {"class_id": 30, "confidence": 0.73, "bbox": (9.0, 10.0, 11.0, 12.0), "track_id": 12},
+            {"class_id": 40, "confidence": 0.64, "bbox": (13.0, 14.0, 15.0, 16.0), "track_id": 13},
+        ]
+        model = FakeUltralyticsModel(rows=rows, names=names)
+        tracker = self.tracker_for(
+            model,
+            label_profile="visdrone",
+            class_names=("person",),
+            strict_class_names=True,
+        )
+
+        detections = tracker.track(object())
+
+        self.assertEqual((20, 30), tracker.class_filter.class_ids)
+        self.assertEqual([20, 30], model.track_calls[0]["classes"])
+        self.assertEqual(["person", "person"], [detection.class_name for detection in detections])
+
+    def test_visdrone_van_remains_distinct_and_motorcycle_filter_selects_motor(self):
+        names = {
+            1: "van",
+            2: "truck",
+            3: "motor",
+        }
+
+        van_tracker = self.tracker_for(
+            FakeUltralyticsModel(
+                rows=[{"class_id": 1, "confidence": 0.9, "bbox": (1.0, 2.0, 3.0, 4.0), "track_id": 1}],
+                names=names,
+            ),
+            label_profile="visdrone",
+            class_names=("van",),
+            strict_class_names=True,
+        )
+        self.assertEqual(["van"], [detection.class_name for detection in van_tracker.track(object())])
+        self.assertEqual([1], van_tracker.model.track_calls[0]["classes"])
+
+        motorcycle_tracker = self.tracker_for(
+            FakeUltralyticsModel(
+                rows=[{"class_id": 3, "confidence": 0.8, "bbox": (5.0, 6.0, 7.0, 8.0), "track_id": 2}],
+                names=names,
+            ),
+            label_profile="visdrone",
+            class_names=("motorcycle",),
+            strict_class_names=True,
+        )
+        self.assertEqual(
+            ["motorcycle"],
+            [detection.class_name for detection in motorcycle_tracker.track(object())],
+        )
+        self.assertEqual([3], motorcycle_tracker.model.track_calls[0]["classes"])
+
+    def test_explicit_unavailable_and_empty_class_filters_report_useful_errors(self):
+        names = {1: "pedestrian", 2: "people"}
+
+        with self.assertRaisesRegex(DetectionClassFilterError, r"Available model classes \(normalized\)"):
+            self.tracker_for(
+                FakeUltralyticsModel(rows=[], names=names),
+                label_profile="visdrone",
+                class_names=("boat",),
+                strict_class_names=True,
+            )
+
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            run_perception.parse_class_names(" , ")
+
+        with patch.object(sys, "argv", ["run_perception.py", "--classes", " , "]):
+            with self.assertRaises(SystemExit):
+                run_perception.parse_args()
+
+    def test_ambiguous_duplicate_model_label_metadata_is_rejected(self):
+        with self.assertRaisesRegex(DetectionClassFilterError, "Ambiguous model class metadata"):
+            self.tracker_for(
+                FakeUltralyticsModel(rows=[], names={1: "car", 2: "car"}),
+                label_profile="visdrone",
+            )
 
     def test_filtered_empty_frames_skip_appearance_work_and_emit_no_observations(self):
         capture = FakeCapture([(True, FakeFrame())])
@@ -680,6 +803,7 @@ class CameraPerceptionTest(unittest.TestCase):
                 confidence=0.91,
                 bbox_xyxy=(10.0, 20.0, 110.0, 220.0),
                 class_id=0,
+                model_class_name="person",
                 local_track_id=local_track_id,
             ),
             metadata,
@@ -697,6 +821,35 @@ class CameraPerceptionTest(unittest.TestCase):
         self.assertNotIn("latitude", payload)
         self.assertNotIn("longitude", payload)
         self.assertEqual(payload, line_payload)
+
+    def test_original_model_labels_survive_observation_serialization(self):
+        adapter = ImageObservationAdapter()
+        metadata = FrameMetadata(
+            node_id="node-1",
+            camera_id="camera-0",
+            camera_session_id="session-a",
+            frame_sequence=3,
+            image_width_px=640,
+            image_height_px=480,
+            timestamp_utc="2026-11-16T12:00:00.000Z",
+        )
+        observation = adapter.observation_from_detection(
+            Detection(
+                class_name="person",
+                confidence=0.91,
+                bbox_xyxy=(10.0, 20.0, 110.0, 220.0),
+                class_id=7,
+                model_class_name="people",
+                local_track_id=42,
+            ),
+            metadata,
+        )
+
+        payload = json.loads(observation.to_json_line())
+
+        self.assertEqual("person", payload["class_name"])
+        self.assertEqual(7, payload["model_class_id"])
+        self.assertEqual("people", payload["model_class_name"])
 
     def test_track_ids_are_scoped_to_camera_session(self):
         first = self.observation_for("session-a", 7)
@@ -801,8 +954,8 @@ class CameraPerceptionTest(unittest.TestCase):
         self.assertEqual(3840, payload["image_width_px"])
         self.assertEqual(2160, payload["image_height_px"])
         self.assertEqual(
-            {"x_min_px": 1000.0, "y_min_px": 500.0, "x_max_px": 1500.0, "y_max_px": 1600.0},
-            payload["pixel_bbox"],
+            {"x_min": 1000.0, "y_min": 500.0, "x_max": 1500.0, "y_max": 1600.0},
+            payload["bbox_px"],
         )
 
     def test_runner_cleans_up_on_user_quit(self):

@@ -56,6 +56,8 @@ class RunnerConfig:
     source_label: str = "unknown"
     appearance_debug: bool = False
     class_filter_label: str = "all model classes"
+    label_profile: str = "coco"
+    active_class_label: str = "all model classes"
     requested_inference_size_px: int | None = None
     model_identifier: str | None = None
 
@@ -71,6 +73,8 @@ class RunnerConfig:
         source_label: str = "unknown",
         appearance_debug: bool = False,
         class_filter_label: str = "all model classes",
+        label_profile: str = "coco",
+        active_class_label: str = "all model classes",
         requested_inference_size_px: int | None = None,
         model_identifier: str | None = None,
     ) -> "RunnerConfig":
@@ -83,6 +87,8 @@ class RunnerConfig:
             source_label=source_label,
             appearance_debug=appearance_debug,
             class_filter_label=class_filter_label,
+            label_profile=label_profile,
+            active_class_label=active_class_label,
             requested_inference_size_px=requested_inference_size_px,
             model_identifier=model_identifier,
         )
@@ -176,6 +182,8 @@ class CameraPerceptionRunner:
                                 "observations_written": observations_written,
                                 "appearance_debug": self.config.appearance_debug,
                                 "class_filter_label": self.config.class_filter_label,
+                                "label_profile": self.config.label_profile,
+                                "active_class_label": self.config.active_class_label,
                                 "requested_inference_size_px": self.config.requested_inference_size_px,
                                 "model_identifier": self.config.model_identifier,
                                 "frame_width_px": metadata.image_width_px,

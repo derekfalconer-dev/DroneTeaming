@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 from perception.capture import CameraConfig, OpenCVCameraCapture
-from perception.detector import DEFAULT_SAR_CLASS_NAMES, DetectionClassFilterError
+from perception.detector import DEFAULT_SAR_CLASS_NAMES, LABEL_PROFILE_NAMES, DetectionClassFilterError
 from perception.display import OpenCVDisplay
 from perception.exceptions import CameraUnavailableError, MissingDependencyError, ModelLoadError, PerceptionError
 from perception.runner import CameraPerceptionRunner, RunnerConfig
@@ -107,6 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-id", default="camera-0")
     parser.add_argument("--camera-session-id", default=None, help="Optional explicit session ID; defaults to a generated ID scoped to this camera run.")
     parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--label-profile", choices=LABEL_PROFILE_NAMES, default="coco", help="Class-label profile used to normalize model labels before filtering and serialization.")
     class_filter_group = parser.add_mutually_exclusive_group()
     class_filter_group.add_argument("--classes", default=None, help="Comma-separated model class names to keep. Names are resolved against the loaded model; numeric class IDs are not accepted.")
     class_filter_group.add_argument("--all-classes", action="store_true", help="Disable SAR class filtering for debugging and emit every model class.")
@@ -166,14 +167,16 @@ def main() -> int:
             class_names=class_names,
             strict_class_names=args.classes is not None,
             inference_image_size=args.imgsz,
+            label_profile=args.label_profile,
         )
         print(f"Model: {args.model}")
+        print(f"Label profile: {args.label_profile}")
         print(
             f"Requested inference size: imgsz={args.imgsz}px "
             "(Ultralytics may resize/pad internally; original image coordinates are preserved)."
         )
         print("Original frame dimensions: measured per frame and shown in the live panel.")
-        print(f"Detection class filter: {detector.class_filter.startup_label}")
+        print(f"Supported active classes: {detector.class_filter.startup_label}")
         if detector.class_filter.unsupported_names:
             print(
                 "Unsupported requested SAR categories for this model: "
@@ -191,6 +194,8 @@ def main() -> int:
                 source_label=args.source,
                 appearance_debug=args.appearance_debug,
                 class_filter_label=detector.class_filter.panel_label,
+                label_profile=args.label_profile,
+                active_class_label=detector.class_filter.panel_label,
                 requested_inference_size_px=args.imgsz,
                 model_identifier=args.model,
             ),
