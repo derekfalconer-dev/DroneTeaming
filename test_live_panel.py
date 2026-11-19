@@ -1,5 +1,6 @@
 import unittest
 
+from perception.detector import Detection
 from perception.display import OpenCVDisplay
 from perception.runner import CameraPerceptionRunner, RunnerConfig
 
@@ -141,6 +142,7 @@ class LivePanelRunnerTest(unittest.TestCase):
 
         self.assertEqual(result.frames_processed, 1)
         self.assertEqual(result.observations_written, 1)
+        self.assertEqual(1, len(writer.observation_batches[0]))
         self.assertIs(writer.observation_batches[0], adapter.observations)
         self.assertIs(display.observations, adapter.observations)
         self.assertIsNotNone(display.context)
@@ -157,6 +159,8 @@ class LivePanelRunnerTest(unittest.TestCase):
         self.assertEqual(display.context["model_identifier"], "test-model.pt")
         self.assertEqual(display.context["frame_width_px"], 640)
         self.assertEqual(display.context["frame_height_px"], 480)
+        self.assertEqual(display.context["contact_counts"], {"tentative": 0, "confirmed": 0, "coasting": 0})
+        self.assertEqual(display.context["contacts"], [])
         self.assertFalse(display.context["appearance_debug"])
         self.assertIn("frame_timestamp_utc", display.context)
         self.assertIn("processing_fps", display.context)
@@ -220,6 +224,62 @@ class LivePanelRunnerTest(unittest.TestCase):
         self.assertIsNotNone(display.context)
         self.assertEqual(display.context["label_profile"], "visdrone")
         self.assertEqual(display.context["active_class_label"], "person, car, van")
+
+    def test_display_formats_contact_and_timing_metrics(self) -> None:
+        display = object.__new__(OpenCVDisplay)
+
+        self.assertEqual("n/a for file decode", display._format_capture_rate({"source_mode": "file", "capture_rate_hz": 0.0}))
+        self.assertEqual("12.5 Hz", display._format_capture_rate({"source_mode": "camera", "capture_rate_hz": 12.5}))
+        self.assertEqual(
+            "12/34 ms",
+            display._format_image_age(
+                {
+                    "image_age_at_inference_start_s": 0.012,
+                    "image_age_at_result_completion_s": 0.034,
+                }
+            ),
+        )
+        self.assertEqual(
+            "1/2/3",
+            display._format_contact_counts(
+                {"contact_counts": {"tentative": 1, "confirmed": 2, "coasting": 3}}
+            ),
+        )
+        self.assertEqual("4.200s", display._format_source_time({"source_time_s": 4.2}))
+
+    def test_display_combines_lifecycle_and_detection_labels_for_tracked_contacts(self) -> None:
+        display = object.__new__(OpenCVDisplay)
+
+        label = display._format_detection_lifecycle_label(
+            {
+                "lifecycle_state": "confirmed",
+                "stabilized_class": "person",
+                "local_track_id": 7,
+            },
+            Detection("car", 0.87, (1.0, 2.0, 3.0, 4.0), local_track_id=7),
+        )
+
+        self.assertEqual("confirmed: person id=7 score=0.87 raw=car", label)
+
+    def test_display_hides_stale_coasting_contacts_from_image_overlay(self) -> None:
+        display = object.__new__(OpenCVDisplay)
+
+        contact = {"lifecycle_state": "coasting", "last_observed_source_time_s": 1.0}
+
+        self.assertAlmostEqual(
+            0.4,
+            display._coasting_last_seen_age_s(
+                contact,
+                {"source_time_s": 1.4, "contact_coasting_display_max_elapsed_s": 1.0},
+            ),
+            places=6,
+        )
+        self.assertIsNone(
+            display._coasting_last_seen_age_s(
+                contact,
+                {"source_time_s": 2.2, "contact_coasting_display_max_elapsed_s": 1.0},
+            )
+        )
 
     def test_display_formats_inference_request_as_requested_size_not_tensor_shape(self) -> None:
         display = object.__new__(OpenCVDisplay)

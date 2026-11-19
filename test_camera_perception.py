@@ -16,6 +16,7 @@ from perception.detector import Detection, DetectionClassFilterError, Ultralytic
 from perception.display import OpenCVDisplay
 from perception.exceptions import MissingDependencyError, UnlocatedObservationError
 from perception.runner import CameraPerceptionRunner, RunnerConfig
+from perception.writer import JsonlContactEventWriter, JsonlObservationWriter
 import run_perception
 
 
@@ -150,6 +151,21 @@ class RunPerceptionCliTest(unittest.TestCase):
                 with patch.object(sys, "argv", ["run_perception.py", "--imgsz", value]):
                     with self.assertRaises(SystemExit):
                         run_perception.parse_args()
+
+    def test_contact_confirmation_cli_defaults_and_validation(self):
+        with patch.object(sys, "argv", ["run_perception.py"]):
+            args = run_perception.parse_args()
+            self.assertEqual(3, args.confirmation_hits)
+            self.assertEqual(5, args.confirmation_window)
+            self.assertEqual("auto", args.source_mode)
+
+        with patch.object(
+            sys,
+            "argv",
+            ["run_perception.py", "--confirmation-hits", "6", "--confirmation-window", "5"],
+        ):
+            with self.assertRaises(SystemExit):
+                run_perception.parse_args()
 
     def test_label_profile_defaults_to_coco_and_accepts_visdrone(self):
         with patch.object(sys, "argv", ["run_perception.py"]):
@@ -392,7 +408,7 @@ class DetectionClassFilteringTest(unittest.TestCase):
 
         result = runner.run()
 
-        self.assertEqual("completed", result.stopped_reason)
+        self.assertEqual("max_frames_reached", result.stopped_reason)
         self.assertEqual(1, result.frames_processed)
         self.assertEqual(0, result.observations_written)
         self.assertEqual([], appearance_analyzer.calls)
@@ -809,6 +825,11 @@ class CameraPerceptionTest(unittest.TestCase):
             metadata,
         )
 
+    def test_raw_jsonl_schema_remains_compatible_and_contact_events_are_separate(self):
+        observation = self.observation_for()
+        self.assertEqual("image-observation-v1", observation.to_dict()["schema_version"])
+        self.assertNotIn("contact_ref", observation.to_dict())
+
     def test_observation_serializes_unknown_geolocation_without_zero_coordinates(self):
         observation = self.observation_for()
         payload = observation.to_dict()
@@ -948,8 +969,9 @@ class CameraPerceptionTest(unittest.TestCase):
 
         result = runner.run()
 
-        self.assertEqual("completed", result.stopped_reason)
+        self.assertEqual("max_frames_reached", result.stopped_reason)
         self.assertEqual(1, result.observations_written)
+        self.assertEqual(1, len(writer.observations))
         payload = writer.observations[0].to_dict()
         self.assertEqual(3840, payload["image_width_px"])
         self.assertEqual(2160, payload["image_height_px"])
@@ -975,6 +997,7 @@ class CameraPerceptionTest(unittest.TestCase):
         self.assertEqual("user_requested", result.stopped_reason)
         self.assertEqual(1, result.frames_processed)
         self.assertEqual(1, result.observations_written)
+        self.assertEqual(1, len(writer.observations))
         self.assertTrue(capture.released)
         self.assertTrue(writer.closed)
         self.assertTrue(display.closed)

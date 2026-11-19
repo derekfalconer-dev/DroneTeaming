@@ -52,10 +52,23 @@ class OpenCVDisplay:
             max_width_px=self.max_window_width_px - self.panel_width_px,
             max_height_px=self.max_window_height_px,
         )
+        contacts_by_track_id = self._contacts_by_local_track_id(context)
+        active_lifecycle_track_ids = {
+            detection.local_track_id
+            for detection in detections
+            if detection.local_track_id is not None and detection.local_track_id in contacts_by_track_id
+        }
         annotated_video_frame = self._annotated_frame(
             video_frame,
             detections,
             coordinate_scale=coordinate_scale,
+            lifecycle_contacts_by_track_id=contacts_by_track_id,
+        )
+        self._annotate_contact_lifecycle(
+            annotated_video_frame,
+            context,
+            coordinate_scale=coordinate_scale,
+            active_local_track_ids=active_lifecycle_track_ids,
         )
         if bool(context.get("appearance_debug", False)):
             self._annotate_appearance_sampling_regions(
@@ -73,6 +86,7 @@ class OpenCVDisplay:
         detections: list[Detection],
         *,
         coordinate_scale: float = 1.0,
+        lifecycle_contacts_by_track_id: Mapping[object, Mapping[str, object]] | None = None,
     ) -> object:
         display_frame = frame.copy() if hasattr(frame, "copy") else frame
         display_frame = self._as_bgr_frame(display_frame)
@@ -81,18 +95,28 @@ class OpenCVDisplay:
             x_min, y_min, x_max, y_max = [
                 int(round(value * coordinate_scale)) for value in detection.bbox_xyxy
             ]
-            label = f"{detection.class_name} {detection.confidence:.2f}"
-            if detection.local_track_id is not None:
-                label = f"{label} id={detection.local_track_id}"
+            contact = (
+                lifecycle_contacts_by_track_id.get(detection.local_track_id)
+                if lifecycle_contacts_by_track_id is not None and detection.local_track_id is not None
+                else None
+            )
+            if contact is not None:
+                label = self._format_detection_lifecycle_label(contact, detection)
+                color = self._contact_color(str(contact.get("lifecycle_state") or "unknown"))
+            else:
+                label = f"{detection.class_name} {detection.confidence:.2f}"
+                if detection.local_track_id is not None:
+                    label = f"{label} id={detection.local_track_id}"
+                color = (0, 255, 0)
 
-            self.cv2.rectangle(display_frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+            self.cv2.rectangle(display_frame, (x_min, y_min), (x_max, y_max), color, 2)
             self.cv2.putText(
                 display_frame,
                 label,
                 (x_min, max(15, y_min - 8)),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
-                (0, 255, 0),
+                color,
                 2,
                 self.cv2.LINE_AA,
             )
@@ -134,7 +158,14 @@ class OpenCVDisplay:
             f"Inference request: {self._format_inference_request(context.get('requested_inference_size_px'))}",
             f"Original frame: {self._format_frame_dimensions(context)}",
             f"Session: {context.get('camera_session_id', 'unknown')}",
-            f"FPS: {float(context.get('processing_fps', 0.0)):.1f}",
+            f"Mode: {context.get('source_mode', 'auto')}",
+            f"Capture rate: {self._format_capture_rate(context)}",
+            f"Processed-image rate: {float(context.get('processing_fps', 0.0)):.1f} Hz",
+            f"Overwritten pending frames: {context.get('overwritten_frame_count', 0)}",
+            f"Image age start/result: {self._format_image_age(context)}",
+            f"Source time: {self._format_source_time(context)}",
+            f"Contacts T/C/Coast: {self._format_contact_counts(context)}",
+            "Legend: green=fresh, yellow=tentative, cyan=confirmed, orange=coasting last-seen",
             f"Frame: {context.get('frame_sequence', 'unknown')}",
             f"Received UTC: {context.get('frame_timestamp_utc', 'unknown')}",
             f"Observations total: {context.get('observations_written', 0)}",
@@ -182,6 +213,45 @@ class OpenCVDisplay:
             return "unknown; tensor shape may differ"
 
         return f"imgsz={int(round(requested_size))}px requested; tensor shape may differ"
+
+    def _format_capture_rate(self, context: Mapping[str, object]) -> str:
+        capture_rate = context.get("capture_rate_hz")
+        if not self._is_finite_number(capture_rate) or float(capture_rate) <= 0.0:
+            source_mode = str(context.get("source_mode", "auto"))
+            if source_mode == "file":
+                return "n/a for file decode"
+            return "n/a"
+
+        return f"{float(capture_rate):.1f} Hz"
+
+    def _format_image_age(self, context: Mapping[str, object]) -> str:
+        start_age = context.get("image_age_at_inference_start_s")
+        result_age = context.get("image_age_at_result_completion_s")
+        if not self._is_finite_number(start_age) or not self._is_finite_number(result_age):
+            return "n/a"
+
+        return f"{float(start_age) * 1000:.0f}/{float(result_age) * 1000:.0f} ms"
+
+    def _format_source_time(self, context: Mapping[str, object]) -> str:
+        source_time = context.get("source_time_s")
+        if not self._is_finite_number(source_time):
+            return "unknown"
+
+        return f"{float(source_time):.3f}s"
+
+    def _format_contact_counts(self, context: Mapping[str, object]) -> str:
+        counts = context.get("contact_counts")
+        if not isinstance(counts, Mapping):
+            return "0/0/0"
+
+        return (
+            f"{int(counts.get('tentative', 0))}/"
+            f"{int(counts.get('confirmed', 0))}/"
+            f"{int(counts.get('coasting', 0))}"
+        )
+
+    def _is_finite_number(self, value: object) -> bool:
+        return not isinstance(value, bool) and isinstance(value, int | float) and math.isfinite(float(value))
 
     def _format_frame_dimensions(self, context: Mapping[str, object]) -> str:
         width_px = context.get("frame_width_px")
@@ -457,6 +527,127 @@ class OpenCVDisplay:
                 int(round(float(value) * coordinate_scale)) for value in values
             ]
             self.cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 255), 1)
+
+    def _annotate_contact_lifecycle(
+        self,
+        frame: object,
+        context: Mapping[str, object],
+        *,
+        coordinate_scale: float,
+        active_local_track_ids: set[object] | None = None,
+    ) -> None:
+        contacts = context.get("contacts")
+        if not isinstance(contacts, Sequence) or isinstance(contacts, str | bytes):
+            return
+
+        for contact in contacts:
+            if not isinstance(contact, Mapping):
+                continue
+
+            if active_local_track_ids is not None and contact.get("local_track_id") in active_local_track_ids:
+                continue
+
+            state = str(contact.get("lifecycle_state") or "unknown")
+            if state == "lost":
+                continue
+            if state == "coasting" and self._coasting_last_seen_age_s(contact, context) is None:
+                continue
+
+            bbox = contact.get("bbox_px")
+            if not isinstance(bbox, Mapping):
+                continue
+
+            values = [bbox.get("x_min"), bbox.get("y_min"), bbox.get("x_max"), bbox.get("y_max")]
+            if not all(isinstance(value, int | float) for value in values):
+                continue
+
+            x_min, y_min, x_max, y_max = [
+                int(round(float(value) * coordinate_scale)) for value in values
+            ]
+            designation = str(bbox.get("designation") or "measured")
+            color = self._contact_color(state)
+            self.cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), color, 2)
+            label = f"{state}"
+            last_seen_age_s = self._coasting_last_seen_age_s(contact, context)
+            if designation == "last_seen" and last_seen_age_s is not None:
+                label = f"{label} last seen {last_seen_age_s:.1f}s ago"
+            elif designation == "last_seen":
+                label = f"{label} last seen"
+            stabilized_class = contact.get("stabilized_class")
+            if stabilized_class:
+                label = f"{label}: {stabilized_class}"
+
+            self.cv2.putText(
+                frame,
+                label,
+                (x_min, max(15, y_min - 28)),
+                self.cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                self.cv2.LINE_AA,
+            )
+
+    def _contacts_by_local_track_id(self, context: Mapping[str, object]) -> dict[object, Mapping[str, object]]:
+        contacts = context.get("contacts")
+        if not isinstance(contacts, Sequence) or isinstance(contacts, str | bytes):
+            return {}
+
+        contacts_by_track_id: dict[object, Mapping[str, object]] = {}
+        for contact in contacts:
+            if not isinstance(contact, Mapping):
+                continue
+
+            local_track_id = contact.get("local_track_id")
+            if local_track_id is not None:
+                contacts_by_track_id[local_track_id] = contact
+
+        return contacts_by_track_id
+
+    def _format_detection_lifecycle_label(
+        self,
+        contact: Mapping[str, object],
+        detection: Detection,
+    ) -> str:
+        state = str(contact.get("lifecycle_state") or "unknown")
+        stabilized_class = str(contact.get("stabilized_class") or detection.class_name)
+        label = f"{state}: {stabilized_class} id={detection.local_track_id} score={detection.confidence:.2f}"
+        if detection.class_name != stabilized_class:
+            label = f"{label} raw={detection.class_name}"
+        return label
+
+    def _coasting_last_seen_age_s(
+        self,
+        contact: Mapping[str, object],
+        context: Mapping[str, object],
+    ) -> float | None:
+        if str(contact.get("lifecycle_state") or "") != "coasting":
+            return None
+
+        event_time_s = context.get("source_time_s")
+        last_seen_time_s = contact.get("last_observed_source_time_s")
+        max_age_s = context.get("contact_coasting_display_max_elapsed_s", 1.0)
+        if (
+            not self._is_finite_number(event_time_s)
+            or not self._is_finite_number(last_seen_time_s)
+            or not self._is_finite_number(max_age_s)
+        ):
+            return None
+
+        age_s = max(0.0, float(event_time_s) - float(last_seen_time_s))
+        if age_s > float(max_age_s):
+            return None
+
+        return age_s
+
+    def _contact_color(self, state: str) -> tuple[int, int, int]:
+        if state == "tentative":
+            return (0, 255, 255)
+        if state == "confirmed":
+            return (255, 255, 0)
+        if state == "coasting":
+            return (0, 165, 255)
+        return (180, 180, 180)
 
     def _format_class_name(self, value: object | None) -> str:
         if value is None:
